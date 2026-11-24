@@ -1,0 +1,13 @@
+name: Ingestion maintenance
+on:
+  schedule:
+    - cron: '13 3 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pipeline:
+    uses: ./.github/workflows/ingestion-pipeline.yml
+    permissions:
+      contents: read
+      packages: read

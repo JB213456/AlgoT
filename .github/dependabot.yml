@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /Data_Ingestion
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /Data_Ingestion/Live
+    schedule:
+      interval: weekly
+  - package-ecosystem: pip
+    directory: /Data_Ingestion/Backfill
+    schedule:
+      interval: weekly
+  - package-ecosystem: docker
+    directory: /Data_Ingestion
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

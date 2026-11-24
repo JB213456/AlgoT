@@ -1,0 +1,28 @@
+name: Ingestion recovery
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: Previously validated GHCR image digest
+        required: true
+      approval_sha:
+        description: Commit SHA explicitly approved for rollback
+        required: true
+permissions:
+  contents: read
+jobs:
+  recovery:
+    if: vars.INGESTION_RECOVERY_ENABLED == 'true' && inputs.approval_sha == github.sha
+    runs-on: [self-hosted, "ingestion-production"]
+    environment: ingestion-production
+    timeout-minutes: 30
+    concurrency: ingestion-production
+    steps:
+      - name: Validate digest
+        env:
+          IMAGE: ${{ inputs.digest }}
+        run: '[[ "$IMAGE" =~ ^ghcr.io/.+@sha256:[a-f0-9]{64}$ ]]'
+      - name: Controlled rollback
+        env:
+          IMAGE: ${{ inputs.digest }}
+        run: /opt/algot-ingestion/deploy.sh recovery "$IMAGE"

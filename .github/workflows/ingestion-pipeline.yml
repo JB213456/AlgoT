@@ -1,0 +1,73 @@
+name: Ingestion pipeline
+on:
+  pull_request:
+    paths:
+      - 'Data_Ingestion/**'
+      - 'Database/market_data_db/**'
+      - 'Database/pyproject.toml'
+      - '.github/workflows/ingestion-*.yml'
+      - '.github/dependabot.yml'
+  push:
+    branches: [main]
+    tags: ['ingestion-v*']
+    paths:
+      - 'Data_Ingestion/**'
+      - 'Database/market_data_db/**'
+      - 'Database/pyproject.toml'
+      - '.github/workflows/ingestion-*.yml'
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ingestion-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    uses: ./.github/workflows/ingestion-ci.yml
+  data:
+    needs: ci
+    uses: ./.github/workflows/ingestion-data-validation.yml
+  security:
+    needs: ci
+    uses: ./.github/workflows/ingestion-security.yml
+  build:
+    needs: [data, security]
+    uses: ./.github/workflows/ingestion-build.yml
+  performance:
+    needs: build
+    uses: ./.github/workflows/ingestion-performance.yml
+  quality-gate:
+    needs: [ci, data, security, build, performance]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all mandatory results
+        env:
+          RESULTS: ${{ needs.ci.result }},${{ needs.data.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs.performance.result }}
+        run: |
+          test "$RESULTS" = 'success,success,success,success,success'
+  delivery:
+    needs: quality-gate
+    if: vars.INGESTION_RELEASE_ENABLED == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ingestion-v')
+    uses: ./.github/workflows/ingestion-delivery.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      release: true
+  staging:
+    needs: delivery
+    if: needs.delivery.result == 'success'
+    uses: ./.github/workflows/ingestion-staging.yml
+    with:
+      image: ${{ needs.delivery.outputs.image }}
+  production:
+    needs: [delivery, staging]
+    if: needs.staging.result == 'success'
+    uses: ./.github/workflows/ingestion-production.yml
+    with:
+      image: ${{ needs.delivery.outputs.image }}
