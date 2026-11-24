@@ -1,0 +1,8 @@
+duckdb>=1.0
+pyarrow>=16.0
+pandas>=2.0
+sqlalchemy>=2.0
+filelock>=3.13
+
+# dev/test
+pytest>=8.0

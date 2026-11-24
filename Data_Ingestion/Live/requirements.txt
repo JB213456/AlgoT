@@ -1,0 +1,7 @@
+alpaca-py>=0.45.0,<0.46.0
+python-dotenv>=1.0.0
+websockets>=17.0
+
+# dev / test
+pytest>=9.0.0
+pytest-asyncio>=1.0.0

@@ -1,0 +1,27 @@
+[project]
+name = "market-data-db"
+version = "0.1.0"
+description = "Standalone market data storage layer for AlgoT (Parquet + DuckDB analytical store, SQLite/Postgres operational metadata)"
+requires-python = ">=3.10"
+dependencies = [
+    "duckdb>=1.0",
+    "pyarrow>=16.0",
+    "pandas>=2.0",
+    "sqlalchemy>=2.0",
+    "filelock>=3.13",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg2-binary>=2.9"]
+dev = ["pytest>=8.0", "pytest-benchmark>=4.0"]
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.29"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["market_data_db*", "server*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

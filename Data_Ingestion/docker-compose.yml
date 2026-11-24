@@ -1,0 +1,86 @@
+services:
+  data-ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: algot/data-ingestion:latest
+    container_name: algot-data-ingestion
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+      # --- Alpaca (live + backfill) ---
+      ALPACA_API_KEY: ${ALPACA_API_KEY:?set ALPACA_API_KEY in .env}
+      ALPACA_SECRET_KEY: ${ALPACA_SECRET_KEY:?set ALPACA_SECRET_KEY in .env}
+      ALPACA_DATA_FEED: ${ALPACA_DATA_FEED:-iex}
+      ALPACA_SYMBOLS: ${ALPACA_SYMBOLS:-AAPL,MSFT,TSLA}
+      ALPACA_SUBSCRIPTIONS: ${ALPACA_SUBSCRIPTIONS:-trades,quotes,bars}
+      ALPACA_WS_DATA_TIMEOUT: ${ALPACA_WS_DATA_TIMEOUT:-}
+      ALPACA_REST_POLL_INTERVAL_SECONDS: ${ALPACA_REST_POLL_INTERVAL_SECONDS:-10}
+      ALPACA_REST_RATE_LIMIT_PER_MINUTE: ${ALPACA_REST_RATE_LIMIT_PER_MINUTE:-200}
+      ALPACA_HEALTH_LOG_INTERVAL_SECONDS: ${ALPACA_HEALTH_LOG_INTERVAL_SECONDS:-30}
+      ALPACA_QUEUE_MAX_SIZE: ${ALPACA_QUEUE_MAX_SIZE:-10000}
+      ALPACA_MAX_CONCURRENT_REQUESTS: ${ALPACA_MAX_CONCURRENT_REQUESTS:-4}
+
+      # --- London Strategic Edge (backfill only) ---
+      LSE_API_KEY: ${LSE_API_KEY:-}
+      LSE_RATE_LIMIT_PER_MINUTE: ${LSE_RATE_LIMIT_PER_MINUTE:-60}
+      LSE_MAX_ROWS_PER_DAY: ${LSE_MAX_ROWS_PER_DAY:-12500000}
+      LSE_MAX_BYTES_PER_WEEK: ${LSE_MAX_BYTES_PER_WEEK:-12884901888}
+      LSE_MAX_ROWS_PER_EXPORT: ${LSE_MAX_ROWS_PER_EXPORT:-2500000}
+      LSE_MAX_CONCURRENT_DOWNLOADS: ${LSE_MAX_CONCURRENT_DOWNLOADS:-1}
+
+      # --- backfill engine bookkeeping (its own coverage SQLite, on the volume) ---
+      BACKFILL_DB_PATH: /data/backfill_coverage/market_data.sqlite3
+      BACKFILL_MAX_RETRIES: ${BACKFILL_MAX_RETRIES:-5}
+      BACKFILL_RETRY_BASE_DELAY_SECONDS: ${BACKFILL_RETRY_BASE_DELAY_SECONDS:-1.0}
+
+      # --- market-data-db (separate service/image; reached over the network) ---
+      # Leave MARKET_DATA_DB_URL empty to run ingestion with no shared-DB writes
+      # (e.g. while that service isn't up yet). Set it once it is, matching the
+      # `algot-db-net` network its own compose file documents.
+      MARKET_DATA_DB_URL: ${MARKET_DATA_DB_URL:-}
+      MARKET_DATA_DB_API_KEY: ${MARKET_DATA_DB_API_KEY:-}
+      LIVE_DB_FLUSH_INTERVAL_SECONDS: ${LIVE_DB_FLUSH_INTERVAL_SECONDS:-5}
+      LIVE_HEARTBEAT_MAX_STALENESS_SECONDS: ${LIVE_HEARTBEAT_MAX_STALENESS_SECONDS:-60}
+    volumes:
+      - ingestion_data:/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "ingestion_runtime.healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "${INGESTION_CPU_LIMIT:-2.0}"
+          memory: ${INGESTION_MEM_LIMIT:-1g}
+        reservations:
+          cpus: "0.25"
+          memory: 256m
+    mem_limit: ${INGESTION_MEM_LIMIT:-1g}
+    cpus: "${INGESTION_CPU_LIMIT:-2.0}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - default
+      - algot-db-net
+
+networks:
+  default:
+    name: algot-ingestion-net
+  algot-db-net:
+    external: true
+
+volumes:
+  ingestion_data:
+    name: algot_ingestion_data

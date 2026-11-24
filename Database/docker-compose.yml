@@ -1,0 +1,60 @@
+services:
+  market-data-db:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: algot/market-data-db:latest
+    container_name: algot-market-data-db
+    restart: unless-stopped
+    environment:
+      MARKET_DATA_DB_ROOT: /data
+      # SQLite by default; point at Postgres instead for multi-worker/process
+      # concurrency, e.g. postgresql://user:pass@host:5432/market_data_db
+      MARKET_DATA_DB_METADATA_URL: ${MARKET_DATA_DB_METADATA_URL:-}
+      MARKET_DATA_DB_API_KEYS: ${MARKET_DATA_DB_API_KEYS:?set MARKET_DATA_DB_API_KEYS in .env}
+      UVICORN_WORKERS: ${UVICORN_WORKERS:-1}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports:
+      # Published only for host-side debugging/ops; other AlgoT containers should
+      # reach the service via the algot-db-net network at market-data-db:8000.
+      - "127.0.0.1:${MARKET_DATA_DB_HOST_PORT:-8000}:8000"
+    volumes:
+      - market_data_lake:/data
+    networks:
+      - algot-db-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "${MARKET_DATA_DB_CPU_LIMIT:-2.0}"
+          memory: ${MARKET_DATA_DB_MEM_LIMIT:-2g}
+        reservations:
+          cpus: "0.5"
+          memory: 512m
+    mem_limit: ${MARKET_DATA_DB_MEM_LIMIT:-2g}
+    cpus: "${MARKET_DATA_DB_CPU_LIMIT:-2.0}"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    stop_grace_period: 35s
+    read_only: false
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  # Fixed name so other AlgoT docker-compose projects (e.g. the ingestion
+  # platform) can attach to it with `networks: {algot-db-net: {external: true}}`.
+  algot-db-net:
+    name: algot-db-net
+    driver: bridge
+
+volumes:
+  market_data_lake:
+    name: algot_market_data_lake
