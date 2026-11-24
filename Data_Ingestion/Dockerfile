@@ -8,7 +8,7 @@
 # talks to it only over HTTP (MARKET_DATA_DB_URL), so it stays independently
 # deployable and has none of that service's heavier dependencies
 # (duckdb/pyarrow/sqlalchemy).
-FROM python:3.12-slim AS base
+FROM python:3.12-slim@sha256:a0e2dd78cc679ddfffea960fe45ecfcff9ac2f68d67917a0edfcde5c2100151b AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -18,9 +18,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 # ---- builder: build wheels for all three local packages in one isolated layer ----
 FROM base AS builder
 WORKDIR /build
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential=12.12 \
     && rm -rf /var/lib/apt/lists/*
 
+COPY constraints.lock /build/constraints.lock
 COPY Live/live_ingestion ./live_ingestion
 COPY Live/pyproject.toml ./live_pyproject.toml
 COPY Backfill/backfill_engine ./backfill_engine
@@ -39,9 +40,9 @@ RUN mkdir -p /build/live_src /build/backfill_src /build/runtime_src \
     && cp -r ingestion_runtime /build/runtime_src/ingestion_runtime \
     && cp runtime_pyproject.toml /build/runtime_src/pyproject.toml
 
-RUN pip wheel --wheel-dir /wheels /build/live_src \
-    && pip wheel --wheel-dir /wheels /build/backfill_src \
-    && pip wheel --wheel-dir /wheels --find-links=/wheels /build/runtime_src
+RUN pip wheel --constraint /build/constraints.lock --wheel-dir /wheels /build/live_src \
+    && pip wheel --constraint /build/constraints.lock --wheel-dir /wheels /build/backfill_src \
+    && pip wheel --constraint /build/constraints.lock --wheel-dir /wheels --find-links=/wheels /build/runtime_src
 
 # ---- runtime: minimal image, non-root ---------------------------------------------
 FROM base AS runtime
@@ -51,7 +52,8 @@ RUN groupadd --system --gid 10002 algoting \
 
 WORKDIR /app
 COPY --from=builder /wheels /wheels
-RUN pip install --no-index --find-links=/wheels live-ingestion backfill-engine ingestion-runtime \
+RUN pip install --no-index --find-links=/wheels \
+        live-ingestion==0.1.0 backfill-engine==0.1.0 ingestion-runtime==0.1.0 \
     && rm -rf /wheels
 
 ENV LOG_LEVEL=INFO \
@@ -61,9 +63,9 @@ ENV LOG_LEVEL=INFO \
 RUN mkdir -p /data/backfill_coverage && chown -R algoting:algoting /data /home/algoting
 VOLUME ["/data"]
 
-USER algoting
+USER 10002:10002
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=3 \
-    CMD python -m ingestion_runtime.healthcheck || exit 1
+    CMD ["python", "-m", "ingestion_runtime.healthcheck"]
 
 ENTRYPOINT ["python", "-m", "ingestion_runtime.live_runner"]

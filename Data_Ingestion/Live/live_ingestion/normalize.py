@@ -94,12 +94,12 @@ def normalize_bar(
     updated: bool = False,
     daily: bool = False,
 ) -> Bar:
-    o, h, l, c = float(raw.open), float(raw.high), float(raw.low), float(raw.close)
+    o, h, lo, c = float(raw.open), float(raw.high), float(raw.low), float(raw.close)
     volume = int(raw.volume)
-    if min(o, h, l, c) <= 0:
-        raise ValidationError(f"non-positive OHLC in bar: {o}/{h}/{l}/{c}")
-    if not (l <= o <= h and l <= c <= h):
-        raise ValidationError(f"inconsistent OHLC bar for {raw.symbol}: O={o} H={h} L={l} C={c}")
+    if min(o, h, lo, c) <= 0:
+        raise ValidationError(f"non-positive OHLC in bar: {o}/{h}/{lo}/{c}")
+    if not (lo <= o <= h and lo <= c <= h):
+        raise ValidationError(f"inconsistent OHLC bar for {raw.symbol}: O={o} H={h} L={lo} C={c}")
     if volume < 0:
         raise ValidationError(f"negative bar volume: {volume}")
     return Bar(
@@ -107,7 +107,7 @@ def normalize_bar(
         timestamp=to_utc(raw.timestamp),
         open=o,
         high=h,
-        low=l,
+        low=lo,
         close=c,
         volume=volume,
         trade_count=getattr(raw, "trade_count", None),

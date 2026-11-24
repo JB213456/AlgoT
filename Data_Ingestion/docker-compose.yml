@@ -69,8 +69,14 @@ services:
         max-size: "10m"
         max-file: "5"
     stop_grace_period: 30s
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
     networks:
       - default
       - algot-db-net
