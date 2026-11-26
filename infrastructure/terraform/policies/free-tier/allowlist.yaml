@@ -1,0 +1,100 @@
+# Resource types established as Always Free eligible for this deployment.
+#
+# Fail-closed contract: any resource type in a Terraform plan that is absent
+# from `allowed` is REJECTED, even if it happens to be free. Establishing
+# eligibility is a deliberate act, not a default.
+#
+# Sources: Oracle Cloud Free Tier "Always Free resources" and the OCI price
+# list. Re-verify when adding an entry.
+
+allowed:
+  # --- Networking: no hourly or per-resource charge ---
+  oci_core_vcn: "VCNs are free; no charge for the virtual network itself."
+  oci_core_subnet: "Subnets are free."
+  oci_core_internet_gateway: "Internet gateways carry no charge."
+  oci_core_nat_gateway: "NAT gateways carry no charge; egress is free to 10 TB/month."
+  oci_core_service_gateway: "Service gateways carry no charge."
+  oci_core_route_table: "Route tables are free."
+  oci_core_security_list: "Security lists are free."
+  oci_core_network_security_group: "NSGs are free."
+  oci_core_network_security_group_security_rule: "NSG rules are free."
+
+  # --- Compute and Kubernetes ---
+  oci_containerengine_cluster: "OKE BASIC_CLUSTER control plane is free. Enforced to BASIC below."
+  oci_containerengine_node_pool: "Ampere A1 managed nodes are free within 4 OCPU / 24 GB. Enforced below."
+
+  # --- Storage ---
+  oci_core_volume: "Block volumes are free within the 200 GB combined allowance. Enforced below."
+  oci_objectstorage_bucket: "Object Storage Standard is free within 20 GB."
+  oci_objectstorage_object_lifecycle_policy: "Lifecycle rules are free and are what keep backups inside the 20 GB allowance."
+
+  # --- Container registry ---
+  # NOT enumerated on Oracle's Always Free resources page, and measurement
+  # shows it is NOT free here: an earlier note claiming GBP 0.00 predated
+  # any image push. It bills ~GBP 0.0002/day (~GBP 0.07/year) at ~1 GB.
+  #
+  # It stays allowed deliberately -- the images must live somewhere the OKE
+  # nodes can reach privately, and the alternative stores a registry
+  # credential. That trade-off and the figures are recorded in
+  # docs/infrastructure/FREE-TIER.md ("Container Registry"), which is the
+  # single authority for them. registry-gc.sh bounds the stored bytes and
+  # check-costs.sh reports the SKU daily.
+  oci_artifacts_container_repository: "Private OCIR repository. Image storage bills ~GBP 0.07/year at ~1 GB -- small but NOT free; accepted in FREE-TIER.md, enforced private below, bounded by registry-gc.sh."
+
+  # --- Vault ---
+  # "150 total Always Free secrets (across any number of vaults)" and
+  # "All master encryption keys protected by software are free".
+  # Virtual private vaults are excluded from Always Free -- and this
+  # tenancy's virtual-private-vault-count limit is 0, so one cannot be made.
+  oci_kms_vault: "Shared (DEFAULT) virtual vault is free; VIRTUAL_PRIVATE bills and is rejected below."
+  oci_kms_key: "Software-protected master keys are free for any number of versions; HSM is rejected below."
+  oci_vault_secret: "Within the 150 Always Free secrets. This deployment uses 5."
+
+  # --- Identity ---
+  oci_identity_policy: "IAM policies are free."
+  oci_identity_dynamic_group: "Dynamic groups are free."
+
+  # --- Terraform-internal, creates nothing in OCI ---
+  null_resource: "Terraform-only assertion resource; provisions nothing."
+
+# Types known to bill. Listed explicitly so the failure message is specific
+# rather than a generic "not allowlisted".
+denied:
+  oci_load_balancer_load_balancer: "Flexible load balancers bill per hour beyond the single 10 Mbps micro shape; ClusterIP only here."
+  oci_load_balancer_backend_set: "Part of a billable load balancer."
+  oci_network_load_balancer_network_load_balancer: "Network load balancers bill per hour."
+  oci_file_storage_file_system: "File Storage has no Always Free allowance."
+  oci_file_storage_mount_target: "File Storage has no Always Free allowance."
+  oci_database_autonomous_database: "Only 2 specific Always Free ADB shapes qualify; not used by this deployment."
+  oci_database_db_system: "DB systems bill per hour."
+  oci_containerengine_virtual_node_pool: "Virtual nodes bill per pod; explicitly excluded."
+  oci_core_instance: "Standalone instances bypass the node pool's enforced A1 sizing."
+  oci_core_instance_pool: "Instance pools can autoscale past the free allowance."
+  oci_core_cluster_network: "HPC cluster networks bill per node."
+  oci_core_volume_backup_policy_assignment: "Scheduled volume backups bill for backup storage beyond 5 free backups."
+  oci_core_volume_backup: "Volume backup storage bills."
+  oci_core_boot_volume_backup: "Boot volume backup storage bills."
+  oci_monitoring_alarm: "Alarms beyond the free allowance bill; lightweight in-cluster monitoring is used instead."
+  oci_logging_log: "Log ingestion bills per GB."
+  oci_streaming_stream: "Streaming bills per partition-hour."
+  oci_core_public_ip: "Reserved public IPs bill when unattached."
+  oci_bastion_bastion: "Bastion sessions are free but the service is not part of the established envelope."
+  oci_kms_hsm_cluster: "Dedicated HSM clusters bill per hour."
+
+# Hard ceilings, cross-checked against the live tenancy before provisioning.
+limits:
+  max_total_ocpus: 4
+  max_total_memory_gbs: 24
+  max_total_storage_gbs: 200
+  max_block_volume_vpus_per_gb: 10
+  min_boot_volume_gbs: 50
+  allowed_compute_shapes:
+    - VM.Standard.A1.Flex
+  allowed_cluster_types:
+    - BASIC_CLUSTER
+  allowed_bucket_tiers:
+    - Standard
+  allowed_vault_types:
+    - DEFAULT
+  allowed_key_protection_modes:
+    - SOFTWARE

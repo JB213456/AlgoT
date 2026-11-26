@@ -1,0 +1,42 @@
+name: Data/Database pipeline
+on:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: database-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-ci.yml
+    with:
+      service: database
+  security:
+    uses: ./.github/workflows/reusable-security.yml
+    with:
+      service: database
+  build:
+    needs: [ci, security]
+    uses: ./.github/workflows/reusable-docker-build.yml
+    with:
+      service: database
+  container-security:
+    needs: build
+    uses: ./.github/workflows/reusable-container-security.yml
+    with:
+      service: database
+  performance:
+    needs: ci
+    uses: ./.github/workflows/reusable-performance.yml
+    with:
+      service: database
+  quality-gate:
+    if: always()
+    needs: [ci, security, build, container-security, performance]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ needs.ci.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs['container-security'].result }},${{ needs.performance.result }}
+        run: test "$RESULTS" = 'success,success,success,success,success'

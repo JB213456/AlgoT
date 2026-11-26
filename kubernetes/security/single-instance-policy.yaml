@@ -1,0 +1,62 @@
+# Hard cap of one live ingestion instance.
+#
+# Alpaca's free tier permits a single concurrent market data websocket
+# connection. A second live pod would either be rejected outright or cause
+# Alpaca to drop the older connection, and the engine's websocket supervisor
+# retries indefinitely with backoff -- so a stray second replica does not
+# fail loudly, it quietly fights the first one for the subscription while
+# duplicating writes.
+#
+# `replicas: 1` plus `strategy: Recreate` on the Deployment stops the
+# *rollout* from running two pods at once, but nothing stops
+# `kubectl scale --replicas=2`, an edited manifest, or an HPA from breaching
+# the provider limit. The namespace quota does not help either: it allows 12
+# pods.
+#
+# This enforces the limit at the API server, which is the only place it
+# cannot be bypassed by a client. ValidatingAdmissionPolicy is built in
+# (GA since 1.30; this cluster runs 1.34), so it costs no compute and adds
+# no controller to the Always Free footprint.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: algot-single-live-ingestion
+spec:
+  # Fail closed: if the policy cannot be evaluated, reject rather than allow
+  # a change that might double-subscribe the feed.
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["deployments"]
+      # `kubectl scale` writes the scale subresource, not the Deployment, so
+      # without this rule the cap would be trivially bypassed.
+      - apiGroups: ["apps"]
+        apiVersions: ["v1"]
+        operations: ["UPDATE"]
+        resources: ["deployments/scale"]
+  matchConditions:
+    - name: only-live-ingestion
+      expression: "request.name == 'data-ingestion'"
+  validations:
+    # Absent replicas means the API server default of 1.
+    - expression: "!has(object.spec.replicas) || object.spec.replicas <= 1"
+      reason: Forbidden
+      message: >-
+        data-ingestion is limited to 1 replica: Alpaca's free tier allows a
+        single concurrent market data websocket connection, and a second live
+        instance would contend for that subscription and duplicate writes.
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: algot-single-live-ingestion
+spec:
+  policyName: algot-single-live-ingestion
+  validationActions: [Deny]
+  matchResources:
+    namespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: algot-data

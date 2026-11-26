@@ -1,0 +1,10 @@
+name: System maintenance
+on:
+  schedule:
+    - cron: '41 4 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  compatibility:
+    uses: ./.github/workflows/system-integration.yml

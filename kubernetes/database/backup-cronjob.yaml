@@ -1,0 +1,101 @@
+# Weekly database backup, off-node copy, and pruning.
+#
+# The database's own /v1/backups endpoint writes a tar.gz archive onto its
+# 80 GB volume. That alone would not survive loss of the volume, and would
+# grow without bound, so this job also copies new archives into the free
+# Object Storage bucket and prunes the on-volume copies to the newest few.
+#
+# It mounts the database PVC read-write, which requires running on the same
+# node as the database pod (ReadWriteOnce allows multiple pods per node but
+# only one node). The podAffinity below guarantees that; without it the job
+# would sit Pending on a multi-attach error.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: market-data-db-backup
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: market-data-db-backup
+    app.kubernetes.io/part-of: algot
+spec:
+  # 02:15 UTC Sundays: outside US market hours, so it never competes with
+  # live ingestion.
+  schedule: "15 2 * * 0"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: market-data-db-backup
+            algot.io/role: maintenance
+            algot.io/database-client: "true"
+            algot.io/oci-metadata: "true"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: algot-maintenance
+          automountServiceAccountToken: false
+          affinity:
+            podAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                - labelSelector:
+                    matchLabels:
+                      app.kubernetes.io/name: market-data-db
+                  topologyKey: kubernetes.io/hostname
+          securityContext:
+            # Same uid/gid as the database so archive ownership stays correct.
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              image: __TOOLBOX_IMAGE__
+              command: [/bin/sh, /scripts/backup-database.sh]
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: OCI_CLI_AUTH
+                  value: instance_principal
+                - name: BACKUP_BUCKET
+                  value: algot-backups
+                - name: OCI_NAMESPACE
+                  value: __OCI_NAMESPACE__
+                - name: DB_URL
+                  value: http://market-data-db.algot-data.svc.cluster.local:8000
+                - name: BACKUP_DIR
+                  value: /data/backups
+                # Archives kept on the volume; older ones live only in
+                # Object Storage, which has its own 30-day retention rule.
+                - name: KEEP_LOCAL
+                  value: "2"
+              envFrom:
+                - secretRef:
+                    name: market-data-db-client
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: [ALL] }
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { cpu: 500m, memory: 512Mi }
+              volumeMounts:
+                - { name: data, mountPath: /data }
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: data
+              persistentVolumeClaim:
+                claimName: market-data-db-data
+            - name: scripts
+              configMap: { name: maintenance-scripts, defaultMode: 0555 }
+            - name: tmp
+              emptyDir: { sizeLimit: 256Mi }

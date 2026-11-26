@@ -1,0 +1,209 @@
+# Live Alpaca ingestion.
+#
+# Checkpoint durability without a third block volume:
+#   OCI's minimum block volume is 50 GB. With 100 GB of boot volumes and the
+#   80 GB database volume, a dedicated checkpoint volume would total 230 GB
+#   and breach the 200 GB Always Free allowance. Instead the backfill
+#   coverage store lives on an emptyDir that an init container restores from
+#   Object Storage (free, 20 GB) at startup and a sidecar snapshots
+#   periodically. That survives pod restarts AND node replacement, which a
+#   node-local volume would not.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: data-ingestion
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: data-ingestion
+    app.kubernetes.io/part-of: algot
+    app.kubernetes.io/component: ingestion
+spec:
+  replicas: 1
+  # Two live ingestion processes would double-subscribe the Alpaca feed and
+  # duplicate writes, so the old pod must stop before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: data-ingestion
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: data-ingestion
+        app.kubernetes.io/part-of: algot
+        app.kubernetes.io/component: ingestion
+        # Grants database access under the database-ingress policy.
+        algot.io/database-client: "true"
+        # Grants the instance-metadata egress the snapshot sidecar needs.
+        algot.io/oci-metadata: "true"
+    spec:
+      serviceAccountName: data-ingestion
+      automountServiceAccountToken: false
+      # live_runner traps SIGTERM, stops the engine and flushes buffered
+      # events to the database before exiting.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        fsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Restores the newest backfill-coverage snapshot so a rescheduled pod
+        # resumes historical downloads instead of restarting them.
+        - name: restore-checkpoints
+          image: __TOOLBOX_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, /scripts/restore-checkpoints.sh]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: OCI_CLI_AUTH
+              value: instance_principal
+            - name: BACKUP_BUCKET
+              value: algot-backups
+            - name: OCI_NAMESPACE
+              value: __OCI_NAMESPACE__
+            - name: CHECKPOINT_DIR
+              value: /data/backfill_coverage
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      containers:
+        - name: live-ingestion
+          image: __INGESTION_IMAGE__
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MARKET_DATA_DB_URL
+              value: http://market-data-db.algot-data.svc.cluster.local:8000
+            - name: LIVE_HEARTBEAT_PATH
+              value: /tmp/live_ingestion_heartbeat
+            - name: LIVE_DB_FLUSH_INTERVAL_SECONDS
+              value: "5"
+            - name: LIVE_HEARTBEAT_MAX_STALENESS_SECONDS
+              value: "60"
+            - name: BACKFILL_DB_PATH
+              value: /data/backfill_coverage/market_data.sqlite3
+            - name: LOG_LEVEL
+              value: INFO
+            - name: ALPACA_SYMBOLS
+              value: AAPL,MSFT,TSLA
+            # Bounded queue: caps memory if the database is slow or
+            # unreachable rather than growing until the pod is OOM-killed.
+            - name: ALPACA_QUEUE_MAX_SIZE
+              value: "10000"
+            - name: ALPACA_MAX_CONCURRENT_REQUESTS
+              value: "4"
+            - name: ALPACA_REST_RATE_LIMIT_PER_MINUTE
+              value: "200"
+          envFrom:
+            - secretRef:
+                name: alpaca-credentials
+            - secretRef:
+                name: market-data-db-client
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 600m
+              memory: 768Mi
+          # The heartbeat file is rewritten every flush tick; a stale file
+          # means the async loop has wedged even though the process is alive.
+          startupProbe:
+            exec:
+              command: [python, -m, ingestion_runtime.healthcheck]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command: [python, -m, ingestion_runtime.healthcheck]
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /data
+            - name: tmp
+              mountPath: /tmp
+        # Snapshots the coverage store to Object Storage so checkpoints
+        # outlive the pod. Shares the emptyDir with the main container.
+        - name: checkpoint-snapshot
+          image: __TOOLBOX_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, /scripts/snapshot-checkpoints.sh]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: OCI_CLI_AUTH
+              value: instance_principal
+            - name: BACKUP_BUCKET
+              value: algot-backups
+            - name: OCI_NAMESPACE
+              value: __OCI_NAMESPACE__
+            - name: CHECKPOINT_DIR
+              value: /data/backfill_coverage
+            - name: SNAPSHOT_INTERVAL_SECONDS
+              value: "300"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          # Bursty by nature: idle between ticks, then a short OCI CLI start-up
+          # that wants most of a core. Measured at the old 200m limit the
+          # sidecar was throttled on 98.4% of scheduling periods (3523s
+          # throttled for 896s of CPU used), which stretched each upload out
+          # to tens of seconds and left checkpoints staler than the 300s
+          # interval implies. The request stays small because the steady state
+          # really is idle; the limit is what the burst needs.
+          resources:
+            requests:
+              cpu: 25m
+              memory: 96Mi
+            limits:
+              cpu: 600m
+              memory: 256Mi
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /data
+            - name: scripts
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: checkpoints
+          emptyDir:
+            sizeLimit: 2Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: scripts
+          configMap:
+            name: checkpoint-scripts
+            defaultMode: 0555

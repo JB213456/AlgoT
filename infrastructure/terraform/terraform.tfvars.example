@@ -1,0 +1,24 @@
+# Copy to terraform.tfvars and fill in. terraform.tfvars is gitignored.
+
+tenancy_ocid     = "ocid1.tenancy.oc1..REPLACE"
+compartment_ocid = "ocid1.compartment.oc1..REPLACE"
+region           = "uk-london-1"
+
+# Both worker nodes and the database volume share this AD. See variables.tf.
+availability_domain = "IiKX:UK-LONDON-1-AD-1"
+
+# Authentication: leave as "DEFAULT" to use ~/.oci/config locally.
+# In CI set this to null and supply user_ocid / fingerprint / private_key_path.
+oci_config_file_profile = "DEFAULT"
+
+# Addresses allowed to reach the Kubernetes API on 6443. Empty means no public
+# ingress rule at all. Use a /32, never 0.0.0.0/0.
+# api_allowed_cidrs = ["203.0.113.4/32"]
+api_allowed_cidrs = []
+
+# --- Always Free envelope: changing these can create a bill ---
+node_count           = 2
+node_ocpus           = 2
+node_memory_gbs      = 12
+node_boot_volume_gbs = 50
+database_volume_gbs  = 80

@@ -1,0 +1,2 @@
+# Pinned so the maintenance image is reproducible.
+oci-cli==3.97.1

@@ -1,0 +1,42 @@
+# Ingestion-only reusable workflow. Invoked by ingestion-pipeline.yml.
+name: Ingestion security
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install pinned free scanners
+        run: |
+          python -m pip install semgrep==1.145.0 pip-audit==2.9.0 pydantic==2.11.10
+      - name: SAST
+        run: semgrep scan --config p/python --error Data/Data_Ingestion/Live/live_ingestion Data/Data_Ingestion/Backfill/backfill_engine Data/Data_Ingestion/ingestion_runtime
+      - name: Dependency audit
+        run: pip-audit -r Data/Data_Ingestion/ci-requirements.txt
+      - name: Secret and policy checks
+        run: python Data/Data_Ingestion/ci/policy.py
+      - name: Validate time-limited security exceptions
+        run: python3 deployment/scripts/validate-security-exceptions.py
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Hadolint
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: Data/Data_Ingestion/Dockerfile
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@471d019012b72cd1e7bb2ee602961347c9ccf560 # v12.3053.0
+        with:
+          directory: Data/Data_Ingestion
+          framework: dockerfile
+      - name: Actionlint
+        run: |
+          curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz -o /tmp/actionlint.tar.gz
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  /tmp/actionlint.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          /tmp/actionlint .github/workflows/*.yml

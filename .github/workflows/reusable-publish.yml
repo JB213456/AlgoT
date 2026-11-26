@@ -1,0 +1,113 @@
+name: Publish previously validated service image
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      sha:
+        type: string
+        required: true
+      run_id:
+        type: string
+        required: true
+    outputs:
+      image:
+        value: ${{ jobs.publish.outputs.image }}
+permissions:
+  contents: read
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ${{ inputs.service }}-release
+    concurrency: release-${{ inputs.service }}
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Verify semantic version, tag and successful exact CI run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVICE: ${{ inputs.service }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ inputs.sha }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          case "$SERVICE" in database|ingestion) ;; *) exit 1 ;; esac
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]]
+          test "$(git rev-parse "refs/tags/$SERVICE-v$VERSION^{commit}")" = "$RELEASE_SHA"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" | jq -e --arg sha "$RELEASE_SHA" '.head_sha == $sha and .conclusion == "success" and .event == "push" and .head_branch == "main" and .path == ".github/workflows/monorepo-pipeline.yml"'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.service }}-image
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: /tmp/candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.service }}-sbom
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: /tmp/sbom
+      - name: Verify and load validated image archive
+        env:
+          SERVICE: ${{ inputs.service }}
+          RELEASE_SHA: ${{ inputs.sha }}
+        run: |
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["bomFormat"] == "CycloneDX" and d["components"]' "/tmp/sbom/$SERVICE-sbom.json"
+          docker load -i "/tmp/candidate/$SERVICE-image.tar"
+          if [ "$SERVICE" = database ]; then IMAGE="algot-database:$RELEASE_SHA"; else IMAGE="ingestion-candidate:$RELEASE_SHA"; fi
+          test -n "$(docker image inspect "$IMAGE" --format '{{.Id}}')"
+      - name: Publish immutable image and semantic tag
+        id: push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SERVICE: ${{ inputs.service }}
+          VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ inputs.sha }}
+        run: |
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if [ "$SERVICE" = database ]; then SOURCE="algot-database:$RELEASE_SHA"; else SOURCE="ingestion-candidate:$RELEASE_SHA"; fi
+          OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          NAME="ghcr.io/$OWNER/algot-$SERVICE"
+          docker tag "$SOURCE" "$NAME:sha-$RELEASE_SHA"
+          docker push "$NAME:sha-$RELEASE_SHA"
+          DIGEST=$(docker image inspect "$NAME:sha-$RELEASE_SHA" --format '{{index .RepoDigests 0}}')
+          [[ "$DIGEST" =~ ^ghcr.io/.+@sha256:[0-9a-f]{64}$ ]]
+          docker tag "$SOURCE" "$NAME:v$VERSION"
+          docker push "$NAME:v$VERSION"
+          docker manifest inspect "$DIGEST" >/dev/null
+          test "$(docker manifest inspect "$NAME:v$VERSION" | sha256sum | cut -d' ' -f1)" = "$(docker manifest inspect "$DIGEST" | sha256sum | cut -d' ' -f1)"
+          {
+            echo "image=$DIGEST"
+            echo "name=$NAME"
+            echo "digest=${DIGEST##*@}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Install checksum-verified Cosign
+        run: bash deployment/scripts/install-cosign.sh
+      - name: Sign and verify published digest
+        env:
+          IMAGE: ${{ steps.push.outputs.image }}
+        run: |
+          cosign sign --yes "$IMAGE"
+          cosign verify --certificate-identity-regexp "^https://github.com/$GITHUB_REPOSITORY/.github/workflows/(reusable-publish|database-release|ingestion-release)\.yml@refs/heads/main$" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE" >/dev/null
+      - name: Attest provenance of published digest
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.push.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

@@ -1,0 +1,164 @@
+# Historical backfill as a one-off Kubernetes Job.
+#
+# Two supported ways to run a backfill:
+#
+#  1. Against the running live pod (shares its coverage store directly):
+#       kubectl exec -n algot-data deployment/data-ingestion -c live-ingestion -- \
+#         market-backfill --symbol AAPL --provider alpaca
+#
+#  2. This Job template, for long or bounded historical runs that should not
+#     share the live pod's CPU budget:
+#       deployment/scripts/run-backfill.sh --symbol AAPL --provider all
+#
+# The Job restores the coverage store from Object Storage first and uploads
+# it again on completion, so runs are resumable across both paths.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # run-backfill.sh appends a timestamp; generateName keeps repeat runs unique.
+  generateName: backfill-
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: data-backfill
+    app.kubernetes.io/part-of: algot
+    app.kubernetes.io/component: ingestion
+spec:
+  backoffLimit: 2
+  # Historical downloads are resumable, but a run must not hang forever
+  # holding provider quota.
+  activeDeadlineSeconds: 21600
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: data-backfill
+        app.kubernetes.io/component: ingestion
+        algot.io/database-client: "true"
+        algot.io/oci-metadata: "true"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: data-ingestion
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        fsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: restore-checkpoints
+          image: __TOOLBOX_IMAGE__
+          command: [/bin/sh, /scripts/restore-checkpoints.sh]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: OCI_CLI_AUTH
+              value: instance_principal
+            - name: BACKUP_BUCKET
+              value: algot-backups
+            - name: OCI_NAMESPACE
+              value: __OCI_NAMESPACE__
+            - name: CHECKPOINT_DIR
+              value: /data/backfill_coverage
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: checkpoints, mountPath: /data }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+        # Native sidecar (restartPolicy: Always on an initContainer). It is
+        # terminated automatically once the backfill container exits, and
+        # performs a final upload when it sees the done-marker.
+        - name: checkpoint-snapshot
+          image: __TOOLBOX_IMAGE__
+          restartPolicy: Always
+          command: [/bin/sh, /scripts/snapshot-on-exit.sh]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: OCI_CLI_AUTH
+              value: instance_principal
+            - name: BACKUP_BUCKET
+              value: algot-backups
+            - name: OCI_NAMESPACE
+              value: __OCI_NAMESPACE__
+            - name: CHECKPOINT_DIR
+              value: /data/backfill_coverage
+            - name: DONE_MARKER
+              value: /data/backfill_coverage/.backfill-complete
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 25m, memory: 96Mi }
+            limits: { cpu: 200m, memory: 256Mi }
+          volumeMounts:
+            - { name: checkpoints, mountPath: /data }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      containers:
+        - name: backfill
+          image: __INGESTION_IMAGE__
+          # Overrides the image's live-ingestion entrypoint. Writes the
+          # done-marker on exit so the sidecar can make a final upload,
+          # and preserves the CLI's own exit status.
+          command: [/bin/sh, -c]
+          args:
+            - |
+              set -u
+              market-backfill "$@"
+              status=$?
+              date -u +%Y-%m-%dT%H:%M:%SZ > "$DONE_MARKER"
+              exit $status
+            - market-backfill
+          env:
+            - name: MARKET_DATA_DB_URL
+              value: http://market-data-db.algot-data.svc.cluster.local:8000
+            - name: BACKFILL_DB_PATH
+              value: /data/backfill_coverage/market_data.sqlite3
+            - name: DONE_MARKER
+              value: /data/backfill_coverage/.backfill-complete
+            - name: LOG_LEVEL
+              value: INFO
+            # Provider quota ceilings. Serialised downloads keep historical
+            # traffic from starving the live feed or breaching free quotas.
+            - name: LSE_MAX_CONCURRENT_DOWNLOADS
+              value: "1"
+            - name: ALPACA_MAX_CONCURRENT_REQUESTS
+              value: "2"
+            - name: ALPACA_REST_RATE_LIMIT_PER_MINUTE
+              value: "100"
+            - name: LSE_RATE_LIMIT_PER_MINUTE
+              value: "60"
+            - name: BACKFILL_MAX_RETRIES
+              value: "5"
+          envFrom:
+            - secretRef: { name: alpaca-credentials }
+            - secretRef: { name: lse-credentials }
+            - secretRef: { name: market-data-db-client }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          # Deliberately smaller than the live pod's budget so a backfill
+          # cannot disrupt continuous live ingestion.
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 768Mi }
+          volumeMounts:
+            - { name: checkpoints, mountPath: /data }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: checkpoints
+          emptyDir: { sizeLimit: 2Gi }
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }
+        - name: scripts
+          configMap: { name: checkpoint-scripts, defaultMode: 0555 }

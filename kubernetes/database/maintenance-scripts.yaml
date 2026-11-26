@@ -1,0 +1,190 @@
+# Maintenance scripts for the database backup, compaction and platform
+# monitoring jobs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: maintenance-scripts
+  namespace: algot-data
+data:
+  compact-datasets.sh: |
+    #!/bin/sh
+    # Merge landing-zone files into deduplicated canonical files, per dataset.
+    #
+    # Compaction is a capacity measure, not a correctness one: reads already
+    # deduplicate by primary key. So one dataset failing must not abort the
+    # sweep -- the others still need compacting tonight. Each dataset is
+    # attempted and failures are collected into the exit status.
+    set -u
+    : "${MARKET_DATA_DB_API_KEY:?MARKET_DATA_DB_API_KEY must be set}"
+
+    DATASETS="bars trades quotes options_quotes options_greeks
+              financial_statements fundamentals earnings
+              corporate_actions macro reference"
+
+    read_physical() {
+      curl -fsS --max-time 30 -H "X-API-Key: $MARKET_DATA_DB_API_KEY" \
+        "$DB_URL/v1/datasets/$1/row-count?dedup=none" 2>/dev/null \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["row_count"])' 2>/dev/null \
+        || true
+    }
+
+    FAIL=0
+    SWEPT=0
+    echo "=== compaction sweep $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+
+    for ds in $DATASETS; do
+      BEFORE=$(read_physical "$ds")
+
+      # No --max-time: compacting a large partition set legitimately takes
+      # minutes, and a truncated request would leave the sweep half-done.
+      BODY=$(curl -fsS -X POST -H "X-API-Key: $MARKET_DATA_DB_API_KEY" \
+        "$DB_URL/v1/datasets/$ds/compact" 2>/dev/null || true)
+
+      if [ -z "$BODY" ]; then
+        echo "dataset $ds: COMPACTION FAILED" >&2
+        FAIL=1
+        continue
+      fi
+
+      ROWS=$(printf '%s' "$BODY" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["rows_compacted"])' 2>/dev/null || echo "?")
+      AFTER=$(read_physical "$ds")
+
+      if [ -n "$BEFORE" ] && [ -n "$AFTER" ]; then
+        echo "dataset $ds: compacted $ROWS rows; physical rows $BEFORE -> $AFTER"
+      else
+        echo "dataset $ds: compacted $ROWS rows"
+      fi
+      SWEPT=$((SWEPT + 1))
+    done
+
+    # Surface duplicates still present after compaction: a non-zero count
+    # here means something compaction cannot resolve by primary key, which
+    # a human should look at.
+    for ds in bars trades quotes; do
+      DUPES=$(curl -fsS --max-time 30 -H "X-API-Key: $MARKET_DATA_DB_API_KEY" \
+        "$DB_URL/v1/datasets/$ds/integrity/duplicates" 2>/dev/null || true)
+      [ -n "$DUPES" ] && echo "dataset $ds post-compaction duplicates: $DUPES"
+    done
+
+    echo "=== compaction swept $SWEPT datasets (exit $FAIL) ==="
+    exit $FAIL
+
+  backup-database.sh: |
+    #!/bin/sh
+    # Create a database backup, copy it off the volume, and prune local copies.
+    set -eu
+    : "${MARKET_DATA_DB_API_KEY:?MARKET_DATA_DB_API_KEY must be set}"
+
+    echo "requesting backup from $DB_URL"
+    LABEL="scheduled-$(date -u +%Y%m%dT%H%M%SZ)"
+    RESPONSE=$(curl -fsS -X POST \
+      -H "X-API-Key: $MARKET_DATA_DB_API_KEY" \
+      "$DB_URL/v1/backups?label=$LABEL")
+    echo "backup created: $RESPONSE"
+
+    ARCHIVE=$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["archive"])')
+    LOCAL="$BACKUP_DIR/$ARCHIVE"
+
+    if [ ! -f "$LOCAL" ]; then
+      echo "FATAL: expected archive $LOCAL was not found on the volume" >&2
+      exit 1
+    fi
+
+    echo "uploading $ARCHIVE to object storage"
+    oci os object put \
+      --namespace "$OCI_NAMESPACE" \
+      --bucket-name "$BACKUP_BUCKET" \
+      --name "database/$ARCHIVE" \
+      --file "$LOCAL" \
+      --force >/dev/null
+    echo "uploaded database/$ARCHIVE"
+
+    # Verify the uploaded object's size matches the local archive before
+    # pruning anything: a short write must not cost us the only good copy.
+    LOCAL_BYTES=$(wc -c < "$LOCAL" | tr -d ' ')
+    # `oci os object head` returns the response HEADERS at the top level of the
+    # JSON document -- there is no "data" wrapper, unlike most oci commands.
+    # Querying 'data."content-length"' therefore always yielded the empty
+    # string, so this check compared a real size against nothing, declared
+    # every upload a size mismatch and failed the job *after* a perfectly good
+    # archive had been uploaded. The backup CronJob had never once reported
+    # success, and because the failure path skips pruning, nothing was pruned
+    # either.
+    REMOTE_BYTES=$(oci os object head \
+      --namespace "$OCI_NAMESPACE" \
+      --bucket-name "$BACKUP_BUCKET" \
+      --name "database/$ARCHIVE" \
+      --query '"content-length"' --raw-output 2>/dev/null || echo "")
+
+    if [ "$LOCAL_BYTES" != "$REMOTE_BYTES" ]; then
+      echo "FATAL: upload size mismatch (local=$LOCAL_BYTES remote=$REMOTE_BYTES); not pruning" >&2
+      exit 1
+    fi
+    echo "verified upload: $REMOTE_BYTES bytes"
+
+    echo "pruning on-volume archives, keeping newest $KEEP_LOCAL"
+    COUNT=0
+    for f in $(ls -1t "$BACKUP_DIR"/*.tar.gz 2>/dev/null); do
+      COUNT=$((COUNT + 1))
+      if [ "$COUNT" -gt "$KEEP_LOCAL" ]; then
+        echo "  removing $(basename "$f") (retained in object storage)"
+        rm -f "$f"
+      fi
+    done
+
+    USED=$(df -P /data | awk 'NR==2 {print $5}')
+    echo "backup complete; /data usage now $USED"
+
+  monitor-platform.sh: |
+    #!/bin/sh
+    # Lightweight health and consumption reporting. Writes to stdout, which
+    # lands in the pod log -- no monitoring stack and no billed OCI service.
+    set -u
+    FAIL=0
+    echo "=== AlgoT data platform report $(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
+
+    # --- database connectivity ---
+    if curl -fsS --max-time 10 "$DB_URL/health" >/tmp/health.json 2>/dev/null; then
+      echo "database: reachable -- $(cat /tmp/health.json)"
+    else
+      echo "database: UNREACHABLE at $DB_URL" >&2
+      FAIL=1
+    fi
+
+    # --- storage utilisation on the database volume ---
+    if [ -d /data ]; then
+      df -Ph /data | awk 'NR==2 {printf "storage: %s used of %s (%s)\n", $3, $2, $5}'
+      PCT=$(df -P /data | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+      if [ "${PCT:-0}" -ge 80 ]; then
+        echo "storage: WARNING ${PCT}% of the 80 GB volume used; it cannot be expanded without leaving the free tier" >&2
+        FAIL=1
+      fi
+    fi
+
+    # --- market data freshness ---
+    if [ -n "${MARKET_DATA_DB_API_KEY:-}" ]; then
+      for ds in trades quotes bars; do
+        BODY=$(curl -fsS --max-time 15 -H "X-API-Key: $MARKET_DATA_DB_API_KEY" \
+          "$DB_URL/v1/datasets/$ds/row-count" 2>/dev/null || echo "")
+        if [ -n "$BODY" ]; then
+          echo "dataset $ds: $BODY"
+        else
+          echo "dataset $ds: no row-count available" >&2
+        fi
+      done
+    fi
+
+    # --- object storage consumption against the 20 GB free allowance ---
+    BYTES=$(oci os object list \
+      --namespace "$OCI_NAMESPACE" \
+      --bucket-name "$BACKUP_BUCKET" \
+      --fields size \
+      --all \
+      --query 'sum(data[].size)' --raw-output 2>/dev/null || echo "")
+    if [ -n "$BYTES" ] && [ "$BYTES" != "null" ]; then
+      echo "backups: $BYTES bytes in $BACKUP_BUCKET (free allowance 20 GB)"
+    fi
+
+    echo "=== end of report (exit $FAIL) ==="
+    exit $FAIL

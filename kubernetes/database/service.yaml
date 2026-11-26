@@ -1,0 +1,39 @@
+# Internal-only ClusterIP. There is no Ingress, no NodePort and no
+# LoadBalancer anywhere in this deployment, so the database is unreachable
+# from outside the cluster by construction -- the namespace quota sets
+# services.loadbalancers and services.nodeports to 0 to keep it that way.
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-data-db
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: market-data-db
+    app.kubernetes.io/part-of: algot
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: market-data-db
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+# Stable DNS for the single replica: market-data-db-0.market-data-db.algot-data.svc
+apiVersion: v1
+kind: Service
+metadata:
+  name: market-data-db-headless
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: market-data-db
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: market-data-db
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

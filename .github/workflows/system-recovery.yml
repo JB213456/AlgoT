@@ -1,0 +1,23 @@
+name: Coordinated system recovery
+on:
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: Previously validated compatible manifest under deployment/manifests
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: system-deploy-production
+  cancel-in-progress: false
+jobs:
+  recover:
+    uses: ./.github/workflows/system-release.yml
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    with:
+      target: production
+      manifest: ${{ inputs.manifest }}
+      recovery: true

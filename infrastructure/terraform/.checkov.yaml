@@ -1,0 +1,67 @@
+# Checkov configuration for the AlgoT OCI deployment.
+#
+# Used by .github/workflows/infrastructure-validate.yml (soft_fail: false) and
+# by local runs:
+#
+#   checkov --config-file infrastructure/terraform/.checkov.yaml
+#
+# Every entry below is a check that is wrong *for this deployment*, with the
+# reason recorded. Genuinely applicable findings are fixed in the Terraform,
+# not skipped here: customer-managed-key encryption (CKV_OCI_3, CKV_OCI_9) and
+# boot-volume in-transit encryption (CKV2_OCI_5) are implemented.
+
+directory:
+  - .
+
+framework:
+  - terraform
+
+quiet: true
+compact: true
+soft-fail: false
+
+skip-check:
+  # The OKE API endpoint is deliberately public and restricted by NSG to an
+  # operator CIDR allowlist. A private endpoint needs a bastion or VPN, and
+  # OCI Bastion is outside the established Always Free envelope.
+  - CKV_OCI_7
+
+  # "NSG does not allow all traffic on RDP port (3389)". Fires on every rule
+  # with protocol "all" or an unrestricted TCP range, including ICMP-only
+  # rules. The rules it flags are worker<->pod and control-plane<->pod flows
+  # sourced from an NSG or the VCN-internal pod/worker CIDRs -- never from the
+  # internet -- and Oracle's OKE network reference requires them for
+  # VCN-native pod networking. Nothing in this VCN listens on 3389; the nodes
+  # are Oracle Linux with no public IP.
+  - CKV2_OCI_2
+
+  # "Ensure security group has stateless ingress security rules". OCI NSG
+  # rules are stateful by default and OKE requires them to stay that way:
+  # stateless rules need a matching rule in the opposite direction for every
+  # flow, and Oracle's own OKE configuration uses stateful rules throughout.
+  # Making these stateless would break control-plane/kubelet return traffic.
+  - CKV_OCI_21
+
+  # "Ensure VCN has an inbound security list" and "Ensure no security list
+  # allows ingress from 0.0.0.0/0 to port 22". The VCN's one security list is
+  # intentionally empty: all filtering lives in the network security groups so
+  # there is exactly one place to reason about it. An empty list denies
+  # everything, so nothing reaches port 22 -- and the nodes have no public IP.
+  - CKV_OCI_16
+  - CKV_OCI_19
+
+  # "Ensure OCI Block Storage Block Volume has backup enabled". Block Volume
+  # backup storage is NOT part of Always Free and bills from the first byte --
+  # it is the single largest charge this tenancy has incurred. The market data
+  # is protected instead by application-level dumps to the versioned
+  # algot-backups Object Storage bucket (free to 20 GB) with lifecycle expiry,
+  # by prevent_destroy on the volume, and by a Retain reclaim policy on its
+  # PersistentVolume. oci_core_volume_backup_policy_assignment is on the
+  # free-tier gate's denied list for the same reason.
+  - CKV_OCI_2
+
+  # "Ensure Kubernetes Engine Cluster pod security policy is enforced".
+  # PodSecurityPolicy was removed in Kubernetes 1.25; this cluster runs
+  # v1.34. is_pod_security_policy_enabled = false is the only valid setting.
+  # Workload hardening is done with Pod Security Admission and NetworkPolicy.
+  - CKV2_OCI_6

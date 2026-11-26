@@ -1,0 +1,172 @@
+# Checkpoint durability helpers, mounted read-only into the ingestion pod.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: checkpoint-scripts
+  namespace: algot-data
+data:
+  restore-checkpoints.sh: |
+    #!/bin/sh
+    # Restore the newest backfill-coverage snapshot, if one exists.
+    # Never fails the pod: with no snapshot the backfill engine simply
+    # rebuilds coverage, which costs provider quota but loses no data.
+    set -u
+    mkdir -p "$CHECKPOINT_DIR"
+
+    if [ -f "$CHECKPOINT_DIR/market_data.sqlite3" ]; then
+      echo "checkpoint store already present; leaving it untouched"
+      exit 0
+    fi
+
+    # --all is REQUIRED, not an optimisation. `oci os object list` returns one
+    # page (~100 objects) by default, so sort_by(...)[-1] picked the newest of
+    # the FIRST PAGE rather than the newest overall. Object names are
+    # chronological, so the first page is the OLDEST snapshots: once the bucket
+    # held more than a page of checkpoints, a restarting pod restored a
+    # progressively staler checkpoint. Observed on a live restart: it restored
+    # market_data-20261125T224313Z while market_data-20261126T130947Z existed,
+    # 14.5 hours newer. The pod then re-downloads history it already had,
+    # burning provider quota that the free data allowance cannot spare.
+    LATEST=$(oci os object list \
+      --namespace "$OCI_NAMESPACE" \
+      --bucket-name "$BACKUP_BUCKET" \
+      --prefix checkpoints/market_data \
+      --fields name,timeCreated \
+      --all \
+      --query 'sort_by(data,&"time-created")[-1].name' \
+      --raw-output 2>/dev/null)
+
+    if [ -z "${LATEST:-}" ] || [ "$LATEST" = "null" ]; then
+      echo "no checkpoint snapshot found; starting with empty coverage"
+      exit 0
+    fi
+
+    echo "restoring checkpoint snapshot: $LATEST"
+    if oci os object get \
+        --namespace "$OCI_NAMESPACE" \
+        --bucket-name "$BACKUP_BUCKET" \
+        --name "$LATEST" \
+        --file "$CHECKPOINT_DIR/market_data.sqlite3" 2>&1; then
+      echo "checkpoint restored"
+    else
+      echo "WARNING: restore failed; starting with empty coverage" >&2
+      rm -f "$CHECKPOINT_DIR/market_data.sqlite3"
+    fi
+    exit 0
+
+  snapshot-checkpoints.sh: |
+    #!/bin/sh
+    # Periodically copy the coverage store to Object Storage.
+    # Uses SQLite's backup API via a read-only URI so the snapshot is
+    # consistent even while the backfill engine is writing.
+    #
+    # Only acts when the coverage store has actually CHANGED since the last
+    # successful upload. The OCI CLI is a large Python program: starting it
+    # costs ~3 CPU-seconds, which against this sidecar's small CPU limit meant
+    # it was throttled on ~98% of scheduling periods and burned more CPU than
+    # the database itself -- every 5 minutes, forever, even when no backfill
+    # was running and the file was byte-for-byte identical. It also wrote a
+    # redundant object to Object Storage on every single tick.
+    #
+    # Durability is unchanged: a real write still produces a new digest and is
+    # uploaded on the next tick.
+    set -u
+    SRC="$CHECKPOINT_DIR/market_data.sqlite3"
+    LAST_DIGEST=""
+
+    while true; do
+      sleep "$SNAPSHOT_INTERVAL_SECONDS"
+
+      [ -f "$SRC" ] || continue
+
+      # cksum is in coreutils/busybox and reads the file once; cheap next to
+      # the CLI start-up it avoids.
+      DIGEST=$(cksum < "$SRC" 2>/dev/null)
+      if [ -n "$DIGEST" ] && [ "$DIGEST" = "$LAST_DIGEST" ]; then
+        continue
+      fi
+
+      if ! python3 - "$SRC" /tmp/snapshot.sqlite3 <<'PY'
+    import sqlite3, sys
+    src, dst = sys.argv[1], sys.argv[2]
+    con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    try:
+        out = sqlite3.connect(dst)
+        try:
+            con.backup(out)
+        finally:
+            out.close()
+    finally:
+        con.close()
+    PY
+      then
+        echo "WARNING: could not snapshot $SRC" >&2
+        continue
+      fi
+
+      STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+      if oci os object put \
+          --namespace "$OCI_NAMESPACE" \
+          --bucket-name "$BACKUP_BUCKET" \
+          --name "checkpoints/market_data-$STAMP.sqlite3" \
+          --file /tmp/snapshot.sqlite3 \
+          --force >/dev/null 2>&1; then
+        echo "checkpoint snapshot uploaded: market_data-$STAMP.sqlite3"
+        # Only remember the digest once the bytes are durably in Object
+        # Storage, so a failed upload is retried on the next tick.
+        LAST_DIGEST="$DIGEST"
+      else
+        echo "WARNING: checkpoint upload failed" >&2
+      fi
+      rm -f /tmp/snapshot.sqlite3
+    done
+  snapshot-on-exit.sh: |
+    #!/bin/sh
+    # Sidecar for backfill Jobs: snapshot periodically, and once more as soon
+    # as the backfill container writes its done-marker, so the final coverage
+    # state is never lost to the sidecar's shutdown.
+    set -u
+    SRC="$CHECKPOINT_DIR/market_data.sqlite3"
+
+    upload() {
+      [ -f "$SRC" ] || return 0
+      python3 - "$SRC" /tmp/snapshot.sqlite3 <<'PY'
+    import sqlite3, sys
+    src, dst = sys.argv[1], sys.argv[2]
+    con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    try:
+        out = sqlite3.connect(dst)
+        try:
+            con.backup(out)
+        finally:
+            out.close()
+    finally:
+        con.close()
+    PY
+      [ -f /tmp/snapshot.sqlite3 ] || return 1
+      STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+      oci os object put \
+        --namespace "$OCI_NAMESPACE" \
+        --bucket-name "$BACKUP_BUCKET" \
+        --name "checkpoints/market_data-$STAMP.sqlite3" \
+        --file /tmp/snapshot.sqlite3 \
+        --force >/dev/null 2>&1
+      rc=$?
+      rm -f /tmp/snapshot.sqlite3
+      return $rc
+    }
+
+    ELAPSED=0
+    while true; do
+      if [ -f "$DONE_MARKER" ]; then
+        echo "backfill finished; performing final checkpoint upload"
+        if upload; then echo "final checkpoint uploaded"; else echo "WARNING: final upload failed" >&2; fi
+        exit 0
+      fi
+      sleep 5
+      ELAPSED=$((ELAPSED + 5))
+      if [ "$ELAPSED" -ge 300 ]; then
+        if upload; then echo "periodic checkpoint uploaded"; fi
+        ELAPSED=0
+      fi
+    done

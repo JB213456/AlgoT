@@ -1,0 +1,39 @@
+# Checkov configuration for the AlgoT Kubernetes manifests.
+#
+# Used by .github/workflows/kubernetes-security.yml and by local runs against
+# a rendered copy of the manifests:
+#
+#   deployment/scripts/render-placeholders.sh /tmp/rendered
+#   checkov --config-file kubernetes/.checkov.yaml --directory /tmp/rendered
+#
+# Checkov is pointed at RENDERED manifests, never at the sources: the sources
+# carry `__DATABASE_IMAGE__`-style placeholders that are substituted from
+# Terraform outputs and the digest manifest at deploy time, and a scanner
+# reading them would report findings about a value that never reaches a
+# cluster.
+#
+# Every entry below is a check that is wrong *for this deployment*, with the
+# reason recorded. Applicable findings are fixed in the manifests, not skipped
+# here.
+
+framework:
+  - kubernetes
+
+quiet: true
+compact: true
+soft-fail: false
+
+skip-check:
+  # "Image should use digest" / image pull policy checks that assume a tag.
+  # Every image here is already pinned to an immutable @sha256 digest, which
+  # is strictly stronger; the rendered stand-in digest is all zeros, which
+  # some of these checks misread as absent.
+  - CKV_K8S_43
+
+  # "Ensure that the --anonymous-auth argument is set to false" and the rest
+  # of the kube-apiserver/kubelet/etcd/scheduler command-line family. These
+  # audit a control plane's own static pod manifests. OKE is a managed
+  # control plane: Oracle operates the apiserver and these manifests do not
+  # exist in this repository, so the checks match nothing a change here
+  # could affect.
+  - CKV_K8S_88

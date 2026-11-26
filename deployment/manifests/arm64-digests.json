@@ -1,0 +1,5 @@
+{
+  "database": "lhr.ocir.io/lrkpmg9jl1yz/algot-database@sha256:d57eb898b41bf44b5bb8ed0319961727fe45c92265d8699a192b27f68e8401b6",
+  "ingestion": "lhr.ocir.io/lrkpmg9jl1yz/algot-ingestion@sha256:705eb0a9eb2c35f7ee832e86ba4fb1c2a6380cd28756f5c90a92fc59823d0974",
+  "toolbox": "lhr.ocir.io/lrkpmg9jl1yz/algot-toolbox@sha256:ef512599dae42ee1a7a27054b5fb5da80ae7ea4ddfe48e537cf83ca445508823"
+}

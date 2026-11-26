@@ -1,0 +1,11 @@
+variable "compartment_ocid" { type = string }
+variable "project_name" { type = string }
+variable "freeform_tags" { type = map(string) }
+variable "availability_domain" { type = string }
+variable "database_volume_gbs" { type = number }
+variable "state_bucket_name" { type = string }
+variable "backup_bucket_name" { type = string }
+variable "node_boot_storage_gbs" { type = number }
+variable "free_tier_max_storage_gbs" { type = number }
+variable "kms_key_id" { type = string }
+variable "encryption_policy_id" { type = string }

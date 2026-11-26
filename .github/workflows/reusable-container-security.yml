@@ -1,0 +1,92 @@
+name: Shared container validation and SBOM
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.service }}-image
+          path: /tmp
+      - name: Install checksum-verified scanners
+        run: bash deployment/scripts/install-security-tools.sh
+      # Suppressions come from deployment/security/exceptions.json and
+      # nowhere else. Emitting also validates the record, so an entry that
+      # has expired, lost its reason or names an unknown scanner fails here
+      # -- before the scan it would otherwise have silenced.
+      - name: Generate the vulnerability ignore file from the exception record
+        run: |
+          python3 deployment/scripts/validate-security-exceptions.py \
+            --emit trivy-image "$RUNNER_TEMP/trivy-image.ignore"
+      - name: Load and inspect exact candidate image
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          case "$SERVICE" in database|ingestion) ;; *) exit 1 ;; esac
+          docker load -i "/tmp/$SERVICE-image.tar"
+          if [ "$SERVICE" = database ]; then IMAGE="algot-database:${{ github.sha }}"; else IMAGE="ingestion-candidate:${{ github.sha }}"; fi
+          test -n "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+          # --ignore-unfixed: this gate blocks on anything that CAN be
+          # fixed, and only on that. Debian 13 currently carries a dozen
+          # HIGH CVEs in base packages (util-linux, libacl1 and others) with
+          # no patched version published, so without this the gate is
+          # permanently red and stops being a signal anyone acts on. It is
+          # also the policy the arm64/OCIR chain already uses, and that
+          # chain found two genuinely fixable CVEs -- libzstd1 and certifi
+          # -- precisely because the unfixable noise was filtered out.
+          #
+          # The next step reports the unfixed findings anyway, so they are
+          # recorded rather than invisible. --ignorefile still applies, for
+          # a *fixable* finding granted a documented, expiring grace period
+          # in deployment/security/exceptions.json.
+          trivy image --exit-code 1 --severity HIGH,CRITICAL --scanners vuln \
+            --ignore-unfixed --ignorefile "$RUNNER_TEMP/trivy-image.ignore" "$IMAGE"
+          syft "docker:$IMAGE" -o "cyclonedx-json=/tmp/$SERVICE-sbom.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["bomFormat"] == "CycloneDX" and d["components"]' "/tmp/$SERVICE-sbom.json"
+
+      # Non-blocking, and deliberately so: these are the findings the gate
+      # above chose not to fail on. Dropping them silently is how a base
+      # image quietly accumulates CVEs that nobody has looked at since the
+      # policy was set, so they go in the run summary where they are part of
+      # the record. If one of these ever gains a fix, the gate above starts
+      # failing on it by itself -- no one has to notice here first.
+      - name: Report the unfixed findings this gate did not block on
+        if: always()
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          # No --ignore-unfixed here, which is the default, so this sees
+          # everything. --exit-code 0 keeps it reporting-only.
+          trivy image --severity HIGH,CRITICAL --scanners vuln \
+            --exit-code 0 --format table "$IMAGE" > /tmp/unfixed.txt 2>/dev/null || true
+
+          COUNT="$(grep -coE 'CVE-[0-9]{4}-[0-9]+|GHSA-[a-z0-9-]+' /tmp/unfixed.txt || true)"
+          {
+            echo "### ${SERVICE}: HIGH/CRITICAL findings with no available fix"
+            echo
+            echo "Not blocking: there is no patched package to upgrade to. Listed so"
+            echo "they are on the record. The gate fails automatically if any of them"
+            echo "gains a fix."
+            echo
+            echo '```'
+            sed -n '1,120p' /tmp/unfixed.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "reported $COUNT finding line(s) with no fix available"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.service }}-sbom
+          path: /tmp/${{ inputs.service }}-sbom.json
+          if-no-files-found: error
+          retention-days: 7

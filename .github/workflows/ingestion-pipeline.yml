@@ -1,0 +1,68 @@
+name: Ingestion pipeline
+on:
+  workflow_call:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ingestion-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-ci.yml
+    with:
+      service: ingestion
+  data:
+    needs: ci
+    uses: ./.github/workflows/ingestion-data-validation.yml
+  security:
+    needs: ci
+    uses: ./.github/workflows/reusable-security.yml
+    with:
+      service: ingestion
+  build:
+    needs: [data, security]
+    uses: ./.github/workflows/ingestion-build.yml
+  container-security:
+    needs: build
+    uses: ./.github/workflows/reusable-container-security.yml
+    with:
+      service: ingestion
+  performance:
+    needs: build
+    uses: ./.github/workflows/reusable-performance.yml
+    with:
+      service: ingestion
+  quality-gate:
+    needs: [ci, data, security, build, container-security, performance]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require all mandatory results
+        env:
+          RESULTS: ${{ needs.ci.result }},${{ needs.data.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs['container-security'].result }},${{ needs.performance.result }}
+        run: |
+          test "$RESULTS" = 'success,success,success,success,success,success'
+
+# This pipeline deliberately ends at the quality gate. It used to continue
+# into delivery, staging and production, and that was wrong twice over.
+#
+# Those jobs were unreachable. This workflow is entered only through
+# workflow_call (from monorepo-pipeline) or workflow_dispatch, and they
+# required `github.event_name == 'push'` with a ref under
+# refs/tags/ingestion-v. monorepo-pipeline does not trigger on tags, so the
+# condition could never hold and the release path never ran from here.
+#
+# They also broke the dispatcher outright. A called job cannot be granted
+# more permission than its caller holds, and the delivery job requested
+# packages, id-token and attestations write while monorepo-pipeline grants
+# only `contents: read`. GitHub validates that statically, before any `if:`
+# is evaluated, so every monorepo-pipeline run failed at startup -- which is
+# how this was found.
+#
+# Release remains a separate, explicitly authorised dispatch:
+# ingestion-release.yml holds the elevated permissions itself and requires
+# INGESTION_RELEASE_ENABLED and GHCR_PRIVATE_CONFIRMED. Keeping it there is
+# also what lets this pipeline -- the one that runs on every pull request --
+# stay read-only.

@@ -1,0 +1,80 @@
+name: Coordinated system deployment
+on:
+  workflow_call:
+    inputs:
+      target:
+        type: string
+        required: true
+      manifest:
+        type: string
+        required: true
+      recovery:
+        type: boolean
+        default: false
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Deployment environment
+        type: choice
+        options: [staging, production]
+        required: true
+      manifest:
+        description: Approved manifest filename under deployment/manifests
+        required: true
+        default: approved.json
+permissions:
+  contents: read
+concurrency:
+  group: system-deploy-${{ inputs.target }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      database_image: ${{ steps.manifest.outputs.database_image }}
+      ingestion_image: ${{ steps.manifest.outputs.ingestion_image }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Require explicit system enablement
+        env:
+          ENABLED: ${{ (inputs.recovery && vars.SYSTEM_RECOVERY_ENABLED) || (!inputs.recovery && vars.SYSTEM_RELEASE_ENABLED) }}
+        run: test "$ENABLED" = true
+      - name: Validate approved compatible digests
+        id: manifest
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          [[ "$MANIFEST" =~ ^[A-Za-z0-9_-]+\.json$ ]]
+          python3 deployment/scripts/validate-manifest.py "deployment/manifests/$MANIFEST"
+  database:
+    needs: validate
+    uses: ./.github/workflows/reusable-deployment.yml
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    with:
+      service: database
+      target: ${{ inputs.target }}
+      image: ${{ needs.validate.outputs.database_image }}
+  ingestion:
+    needs: [validate, database]
+    uses: ./.github/workflows/reusable-deployment.yml
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    with:
+      service: ingestion
+      target: ${{ inputs.target }}
+      image: ${{ needs.validate.outputs.ingestion_image }}
+  quality-gate:
+    if: always()
+    needs: [validate, database, ingestion]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ needs.validate.result }},${{ needs.database.result }},${{ needs.ingestion.result }}
+        run: test "$RESULTS" = 'success,success,success'

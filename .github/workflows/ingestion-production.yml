@@ -1,0 +1,25 @@
+name: Ingestion production
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Signed image digest approved for production
+        required: true
+  workflow_call:
+    inputs:
+      image:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  deploy:
+    uses: ./.github/workflows/reusable-deployment.yml
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    with:
+      service: ingestion
+      target: production
+      image: ${{ inputs.image }}

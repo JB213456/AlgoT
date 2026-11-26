@@ -1,0 +1,73 @@
+# Storage for the market data database.
+#
+# The underlying 80 GB OCI block volume is created and owned by Terraform
+# (infrastructure/terraform/modules/storage), not provisioned dynamically.
+# That means the market data survives deletion of this PVC, the StatefulSet,
+# or the entire algot-data namespace.
+---
+# A static-only StorageClass.
+#
+# Two deliberate choices:
+#
+#  - reclaimPolicy: Retain. The default `oci-bv` class DELETES the backing
+#    block volume when its PVC goes away, which would destroy the market data.
+#
+#  - provisioner: kubernetes.io/no-provisioner. This class can never create a
+#    volume. If it named the real CSI provisioner and the static PV below
+#    failed to match, Kubernetes would dynamically provision a SECOND 80 GB
+#    volume, taking total storage to 260 GB and breaching the 200 GB Always
+#    Free allowance. With no provisioner, a mismatch leaves the claim Pending
+#    -- a visible failure instead of a silent bill.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: algot-bv-retain
+provisioner: kubernetes.io/no-provisioner
+reclaimPolicy: Retain
+allowVolumeExpansion: false
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: market-data-db-pv
+  labels:
+    app.kubernetes.io/name: market-data-db
+    algot.io/protected: "true"
+spec:
+  capacity:
+    storage: 80Gi
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  # Releasing this PV must never erase the volume.
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: algot-bv-retain
+  claimRef:
+    namespace: algot-data
+    name: market-data-db-data
+  csi:
+    driver: blockvolume.csi.oraclecloud.com
+    # Substituted from `terraform output -raw database_volume_id` by
+    # deployment/scripts/deploy-data-platform.sh.
+    volumeHandle: __DATABASE_VOLUME_OCID__
+    fsType: ext4
+  # No nodeAffinity on purpose. Both worker nodes share one availability
+  # domain, so this volume can attach to either -- which is what makes
+  # database failover between nodes possible.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: market-data-db-data
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: market-data-db
+  annotations:
+    algot.io/protected: "Deleting this claim does not delete the market data; the PV and OCI volume are retained."
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: algot-bv-retain
+  volumeName: market-data-db-pv
+  resources:
+    requests:
+      storage: 80Gi

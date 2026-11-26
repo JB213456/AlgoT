@@ -1,0 +1,43 @@
+name: Detect affected tracked services
+description: Classify tracked service paths for selective CI
+inputs:
+  base:
+    required: true
+    description: Base commit SHA
+  head:
+    required: true
+    description: Head commit SHA
+outputs:
+  database:
+    value: ${{ steps.detect.outputs.database }}
+    description: Data/Database affected
+  ingestion:
+    value: ${{ steps.detect.outputs.ingestion }}
+    description: Ingestion affected
+  system:
+    value: ${{ steps.detect.outputs.system }}
+    description: System compatibility affected
+  features:
+    value: ${{ steps.detect.outputs.features }}
+    description: features affected
+  aggregator:
+    value: ${{ steps.detect.outputs.aggregator }}
+    description: aggregator affected
+  portfolio:
+    value: ${{ steps.detect.outputs.portfolio }}
+    description: portfolio affected
+  risk:
+    value: ${{ steps.detect.outputs.risk }}
+    description: risk affected
+  execution:
+    value: ${{ steps.detect.outputs.execution }}
+    description: execution affected
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      env:
+        BASE_SHA: ${{ inputs.base }}
+        HEAD_SHA: ${{ inputs.head }}
+      run: python3 .github/actions/change-detection/detect.py

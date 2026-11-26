@@ -1,0 +1,59 @@
+name: Shared service security
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # Full history: the Gitleaks step below scans tracked history for
+          # secrets, and the default shallow clone has none to scan. It
+          # failed outright ("failed to scan Git repository") rather than
+          # reporting a clean pass, which at least was not silent -- but a
+          # one-commit clone would also have made the gate close to
+          # meaningless even where it did run.
+          fetch-depth: 0
+      - name: Enforce tracked-source boundary
+        run: |
+          test -z "$(git ls-files Strategies)"
+          test -z "$(git ls-files | grep -E '(^|/)(\.env|\.venv)(/|$)' || true)"
+      - name: Install scanners
+        run: python -m pip install 'semgrep==1.145.0' 'pip-audit==2.9.0' 'pydantic==2.11.10' 'pytest==8.4.2'
+      - name: Scan selected service
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          case "$SERVICE" in
+            database) semgrep scan --config p/python --error Data/Database/market_data_db Data/Database/server && pip-audit -r Data/Database/requirements.txt ;;
+            ingestion) semgrep scan --config p/python --error Data/Data_Ingestion/Live/live_ingestion Data/Data_Ingestion/Backfill/backfill_engine Data/Data_Ingestion/ingestion_runtime && python Data/Data_Ingestion/ci/policy.py && pip-audit -r Data/Data_Ingestion/ci-requirements.txt ;;
+            *) exit 1 ;;
+          esac
+      # exceptions.json is the only chokepoint for suppressing a finding in
+      # any scanner, so the gate guarding it is tested before it is trusted:
+      # an expired, unjustified or undocumented suppression must be
+      # rejected, not quietly honoured.
+      - name: Test the security-exception gate
+        run: python -m pytest deployment/scripts/test_validate_security_exceptions.py -q
+      - name: Validate time-limited security exceptions
+        run: python3 deployment/scripts/validate-security-exceptions.py
+      - name: Scan tracked history for secrets
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Validate service Dockerfile
+        uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf # v3.1.0
+        with:
+          dockerfile: ${{ inputs.service == 'database' && 'Data/Database/Dockerfile' || 'Data/Data_Ingestion/Dockerfile' }}
+      - name: Scan Docker configuration
+        uses: bridgecrewio/checkov-action@471d019012b72cd1e7bb2ee602961347c9ccf560 # v12.3053.0
+        with:
+          directory: ${{ inputs.service == 'database' && 'Data/Database' || 'Data/Data_Ingestion' }}
+          framework: dockerfile
