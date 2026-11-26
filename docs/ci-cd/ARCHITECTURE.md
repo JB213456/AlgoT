@@ -8,6 +8,63 @@ Tracked service source now lives under `Data/Database` and `Data/Data_Ingestion`
 
 Shared reusable workflows handle CI, SAST and dependency audit, Docker build, container vulnerability scanning, SBOM generation, performance checks, publishing, and deployment. Ingestion retains its provider/data checks and additional Gitleaks, Hadolint, Checkov and Actionlint checks. System tests exercise the ingestion wire payload through the Database HTTP API with temporary storage and verify exact deduplication. No live provider traffic occurs in routine CI.
 
+## Infrastructure and data-platform layers
+
+`infrastructure-validate`, `kubernetes-validate`, `kubernetes-security` and
+`database-migration-validate` are the credential-free gates. They run on
+pull requests from forks, hold no secret, make no OCI call and touch no
+cluster or database, which is what lets them be mandatory without handing
+untrusted code anything.
+
+`kubernetes-security` is the security counterpart to `kubernetes-validate`:
+the latter asks whether a manifest is well formed and within the free tier,
+the former asks what an attacker would get from a compromised pod. It runs
+four independent jobs — the in-house RBAC/token/network/hardening
+invariants, Checkov, Trivy config, and a server-side admission dry run on a
+throwaway `kind` cluster whose namespace is labelled `restricted`. That last
+one is the only check here with real authority on Pod Security: it asks an
+actual API server. It ends with a control case that applies a privileged
+root pod and requires it to be **rejected**, because a dry run against a
+namespace that was not enforcing anything would otherwise pass every
+manifest and look like success.
+
+`database-migration-validate` gates the one deployment step no image
+rollback undoes. Rolling the container back does not un-drop a column, so
+the chain must be contiguous, append-only against the base revision, free of
+destructive statements, and replayable from every historical version to
+head. The append-only check compares against `git show <base>:…/migrator.py`
+and parses it with `ast` rather than importing it, so it never executes code
+from the revision under test.
+
+Each gate's own test suite runs immediately before the gate does, and those
+tests are mostly of the form "this gate REJECTS a wildcard Role" or "this
+gate REJECTS a DROP TABLE". A gate that silently stopped working would
+otherwise report a clean pass indefinitely, which is worse than no gate.
+
+Deployment and infrastructure apply re-check that the mandatory gates
+actually passed for the exact commit being deployed
+(`deployment/scripts/require-green-gates.sh`), treating a gate that never ran
+as a failure. Both are dispatch-only, so without this a dispatch could name
+any ref and the gates would be advisory.
+
+Persistent data protection is asserted rather than assumed.
+`assert-data-protection.sh` records the bound volume's OCI OCID, the PV and
+PVC identity, the reclaim policy and the row counts before a deploy, and
+re-checks them afterwards and again after any rollback. The failure it exists
+for is a deployment that rebinds the claim to a *different* volume: the
+database then comes up healthy and empty, and every other check passes.
+
+Rollback is per service. `data-platform-deploy` rolls back only the component
+it deployed, and `data-platform-rollback` rolls one service back on request
+and then proves the other service's image and spec generation are unchanged.
+A bad ingestion image must not cost a restart of the pod holding the market
+data volume.
+
+Only `algot-data` is deployed into, and that is enforced:
+`validate-k8s-manifests.py` rejects any namespaced object that targets
+another namespace or omits `metadata.namespace` entirely, and rejects the
+creation of any other namespace.
+
 ## Release path
 
 Each service has an independent `database-vMAJOR.MINOR.PATCH` or `ingestion-vMAJOR.MINOR.PATCH` tag. A manually dispatched service release requires that tag, its exact commit SHA, and a successful default-branch monorepo CI run ID for that SHA. The release workflow downloads the image and SBOM from that run, promotes the same image to private GHCR, records the immutable digest, signs it with Cosign, and attaches build provenance. It never rebuilds the image. Release jobs require `DATABASE_RELEASE_ENABLED=true` or `INGESTION_RELEASE_ENABLED=true`, plus `GHCR_PRIVATE_CONFIRMED=true`; both default to disabled.

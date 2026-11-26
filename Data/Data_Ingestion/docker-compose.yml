@@ -7,7 +7,14 @@ services:
     container_name: algot-data-ingestion
     restart: unless-stopped
     env_file:
-      - .env
+      # .env holds the provider credentials and is deliberately gitignored,
+      # so it does not exist on a fresh clone or on a CI runner. Hard-
+      # requiring it made `docker compose config` fail there before it could
+      # validate anything. Absence is not a way to run unconfigured: the
+      # ${ALPACA_API_KEY:?...} guards below still refuse to start without
+      # credentials, whatever supplies them.
+      - path: .env
+        required: false
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
