@@ -1,23 +1,195 @@
-"""Fail CI on expired or undocumented scanner suppressions."""
-from datetime import date
-import json
-from pathlib import Path
+#!/usr/bin/env python3
+"""Fail CI on expired or undocumented scanner suppressions.
 
-ROOT = Path(__file__).resolve().parents[2]
-record = json.loads((ROOT / 'deployment/security/exceptions.json').read_text())
-if record.get('schema_version') != 1:
-    raise SystemExit('invalid security exception schema')
-entries = record.get('exceptions', [])
-if not isinstance(entries, list):
-    raise SystemExit('security exceptions must be a list')
-expected = set()
-for entry in entries:
-    if entry.get('scanner') != 'gitleaks' or not entry.get('reason'):
-        raise SystemExit('unsupported or unjustified security exception')
-    if date.fromisoformat(entry['expires']) < date.today():
-        raise SystemExit('expired security exception: ' + entry['fingerprint'])
-    expected.add(entry['fingerprint'])
-actual = {line.strip() for line in (ROOT / '.gitleaksignore').read_text().splitlines() if line.strip() and not line.startswith('#')}
-if actual != expected:
-    raise SystemExit('undocumented or missing Gitleaks suppression')
-print(f'{len(expected)} documented, unexpired scanner exception(s)')
+`deployment/security/exceptions.json` is the single place any scanner
+finding may be suppressed, for three scanners:
+
+  gitleaks      a committed-secret fingerprint
+  trivy-image   a vulnerability ID in a container image
+  trivy-config  a misconfiguration check ID in the Kubernetes manifests
+
+Every entry needs a reason and an `expires` date. The expiry is the point:
+an unfixed CVE is suppressed because there is nothing to upgrade to *today*,
+and that stops being true without anyone noticing. An expired entry fails
+this gate, which forces the question to be asked again rather than left to
+rot in an ignore file.
+
+Ignore files are generated from this record rather than committed beside it,
+so the two cannot drift apart and there is no second place to look:
+
+    validate-security-exceptions.py --emit trivy-image /tmp/trivy-image.ignore
+
+With no arguments it validates the record and checks that the one ignore
+file that must stay committed -- .gitleaksignore, which the Gitleaks action
+reads from the repository root -- matches it exactly.
+
+Exit: 0 valid, non-zero otherwise.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+from datetime import date
+
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+RECORD = ROOT / "deployment/security/exceptions.json"
+GITLEAKS_IGNORE = ROOT / ".gitleaksignore"
+
+SCANNERS = {"gitleaks", "trivy-image", "trivy-config"}
+
+# The key that identifies the suppressed finding, per scanner.
+KEY = {
+    "gitleaks": "fingerprint",
+    "trivy-image": "id",
+    "trivy-config": "id",
+}
+
+
+def load() -> list[dict]:
+    try:
+        record = json.loads(RECORD.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"cannot read {RECORD}: {exc}") from exc
+
+    if record.get("schema_version") != 1:
+        raise SystemExit("invalid security exception schema")
+
+    entries = record.get("exceptions", [])
+    if not isinstance(entries, list):
+        raise SystemExit("security exceptions must be a list")
+    return entries
+
+
+def validate(entries: list[dict]) -> dict[str, set[str]]:
+    """Check every entry, and return the live keys grouped by scanner."""
+    live: dict[str, set[str]] = {s: set() for s in SCANNERS}
+    today = date.today()
+    problems: list[str] = []
+
+    for index, entry in enumerate(entries):
+        where = f"exceptions[{index}]"
+        scanner = entry.get("scanner")
+
+        if scanner not in SCANNERS:
+            problems.append(
+                f"{where}: unsupported scanner {scanner!r}; expected one of "
+                f"{', '.join(sorted(SCANNERS))}"
+            )
+            continue
+
+        key_field = KEY[scanner]
+        key = entry.get(key_field)
+        if not key:
+            problems.append(f"{where}: a {scanner} exception needs a {key_field!r}")
+            continue
+
+        # A suppression with no stated reason is indistinguishable from
+        # someone silencing a scanner they did not understand.
+        reason = (entry.get("reason") or "").strip()
+        if len(reason) < 20:
+            problems.append(
+                f"{where} ({key}): needs a reason explaining why this finding "
+                "does not apply here"
+            )
+
+        expires = entry.get("expires")
+        if not expires:
+            problems.append(f"{where} ({key}): needs an 'expires' date")
+            continue
+        try:
+            expiry = date.fromisoformat(expires)
+        except ValueError:
+            problems.append(f"{where} ({key}): 'expires' must be YYYY-MM-DD, got {expires!r}")
+            continue
+
+        if expiry < today:
+            problems.append(
+                f"{where} ({key}): the exception expired on {expiry}. Re-check whether "
+                "a fix is available now; renew it with a current reason only if it is "
+                "still genuinely unfixable."
+            )
+            continue
+
+        live[scanner].add(str(key))
+        days = (expiry - today).days
+        print(f"  {scanner:13s} {key:24s} expires {expiry} ({days} days)")
+
+    if problems:
+        print(f"\nREJECTED: {len(problems)} problem(s) in {RECORD.name}", file=sys.stderr)
+        for problem in problems:
+            print(f"  - {problem}", file=sys.stderr)
+        raise SystemExit(1)
+
+    return live
+
+
+def emit(scanner: str, destination: pathlib.Path, live: dict[str, set[str]]) -> None:
+    keys = sorted(live[scanner])
+    lines = [
+        f"# Generated by {pathlib.Path(__file__).name} from",
+        f"# {RECORD.relative_to(ROOT)} -- do not edit by hand.",
+        f"# Every entry below is documented and unexpired as of {date.today()}.",
+        "",
+    ]
+    lines += keys
+    destination.write_text("\n".join(lines) + "\n")
+    print(
+        f"Wrote {len(keys)} {scanner} suppression(s) to {destination}"
+        + (f": {', '.join(keys)}" if keys else " (none)")
+    )
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--emit",
+        nargs=2,
+        metavar=("SCANNER", "PATH"),
+        help="write the ignore file for SCANNER to PATH",
+    )
+    args = parser.parse_args(argv[1:])
+
+    entries = load()
+    print(f"Checking {len(entries)} scanner exception(s) in {RECORD.relative_to(ROOT)}:")
+    live = validate(entries)
+
+    if args.emit:
+        scanner, path = args.emit
+        if scanner not in SCANNERS:
+            raise SystemExit(f"unknown scanner {scanner!r}; expected one of {sorted(SCANNERS)}")
+        emit(scanner, pathlib.Path(path), live)
+        return 0
+
+    # .gitleaksignore has to stay committed: the Gitleaks action reads it
+    # from the repository root and cannot be pointed at a generated file. So
+    # it is the one case checked for drift instead of generated.
+    if GITLEAKS_IGNORE.exists():
+        actual = {
+            line.strip()
+            for line in GITLEAKS_IGNORE.read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+    else:
+        actual = set()
+
+    expected = live["gitleaks"]
+    if actual != expected:
+        missing = expected - actual
+        undocumented = actual - expected
+        print("\nREJECTED: .gitleaksignore does not match the record", file=sys.stderr)
+        for f in sorted(undocumented):
+            print(f"  - suppressed in .gitleaksignore but not documented (or expired): {f}", file=sys.stderr)
+        for f in sorted(missing):
+            print(f"  - documented but missing from .gitleaksignore: {f}", file=sys.stderr)
+        return 1
+
+    total = sum(len(v) for v in live.values())
+    print(f"\n{total} documented, unexpired scanner exception(s).")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

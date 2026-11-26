@@ -19,6 +19,14 @@ jobs:
           path: /tmp
       - name: Install checksum-verified scanners
         run: bash deployment/scripts/install-security-tools.sh
+      # Suppressions come from deployment/security/exceptions.json and
+      # nowhere else. Emitting also validates the record, so an entry that
+      # has expired, lost its reason or names an unknown scanner fails here
+      # -- before the scan it would otherwise have silenced.
+      - name: Generate the vulnerability ignore file from the exception record
+        run: |
+          python3 deployment/scripts/validate-security-exceptions.py \
+            --emit trivy-image "$RUNNER_TEMP/trivy-image.ignore"
       - name: Load and inspect exact candidate image
         env:
           SERVICE: ${{ inputs.service }}
@@ -27,7 +35,13 @@ jobs:
           docker load -i "/tmp/$SERVICE-image.tar"
           if [ "$SERVICE" = database ]; then IMAGE="algot-database:${{ github.sha }}"; else IMAGE="ingestion-candidate:${{ github.sha }}"; fi
           test -n "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')"
-          trivy image --exit-code 1 --severity HIGH,CRITICAL --scanners vuln "$IMAGE"
+          # Unfixed findings still FAIL unless individually documented and
+          # unexpired in the exception record. --ignore-unfixed is
+          # deliberately not used here: it would silence every future
+          # unpatched CVE in advance, including ones that do affect this
+          # workload, whereas an ignore file names exactly what was reviewed.
+          trivy image --exit-code 1 --severity HIGH,CRITICAL --scanners vuln \
+            --ignorefile "$RUNNER_TEMP/trivy-image.ignore" "$IMAGE"
           syft "docker:$IMAGE" -o "cyclonedx-json=/tmp/$SERVICE-sbom.json"
           python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["bomFormat"] == "CycloneDX" and d["components"]' "/tmp/$SERVICE-sbom.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

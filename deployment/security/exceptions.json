@@ -1,11 +1,31 @@
 {
   "schema_version": 1,
+  "_comment": [
+    "The single place any scanner finding may be suppressed. Every entry needs",
+    "a reason and an expiry; deployment/scripts/validate-security-exceptions.py",
+    "fails CI on an expired or unjustified entry, and generates the scanners'",
+    "ignore files from this record so there is no second place to look.",
+    "Scanners: gitleaks, trivy-image (vulnerability IDs), trivy-config",
+    "(misconfiguration check IDs)."
+  ],
   "exceptions": [
     {
       "scanner": "gitleaks",
       "fingerprint": "d130ba4b4efaf8130314543eb48f797db8c30f11:Data_Ingestion/.env.example:generic-api-key:36",
       "reason": "Historical example has an empty MARKET_DATA_DB_API_KEY; the adjacent numeric flush interval created a multiline generic-key false positive. No credential was committed at this location.",
       "expires": "2027-01-31"
+    },
+    {
+      "scanner": "trivy-image",
+      "id": "CVE-2026-76642",
+      "reason": "util-linux: a failed external mount helper still returns success. Debian 13 ships no patched util-linux, so Trivy reports it with an empty Fixed Version and there is nothing to upgrade to; repinning the python:3.12-slim base does not help. Trivy counts it once per affected package (bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1, login, mount, util-linux), which is why one CVE presents as 53 HIGH findings. Not reachable in these images: nothing in the database or ingestion containers invokes mount, they run as a non-root UID with ALL capabilities dropped and no-new-privileges, the Kubernetes workloads have a read-only root filesystem, and the restricted Pod Security Standard that the admission dry run verifies forbids the privilege needed to call a mount helper at all. Review when Debian publishes a fixed util-linux.",
+      "expires": "2027-03-31"
+    },
+    {
+      "scanner": "trivy-config",
+      "id": "KSV-0053",
+      "reason": "Role should not have access to pods/exec. The algot-data-backfill-operator Role grants create on pods/exec. The escalation path the check warns about, exec into a pod whose ServiceAccount holds higher RBAC permissions, does not exist here, and the precondition is enforced rather than assumed: every pod and every ServiceAccount in algot-data sets automountServiceAccountToken false, so a shell obtained through exec holds no Kubernetes API token at all, and validate-k8s-security.py fails the build if a pod ever runs with a mounted default token or a Role gains wildcard verbs, escalate/bind/impersonate, or read access to Secrets. The containers reached are non-root with a read-only root filesystem and ALL capabilities dropped. pods/exec is required by run-backfill.sh, run-database-integration-tests.sh, verify-deployment.sh, verify-network-policies.sh and assert-data-protection.sh, which read state from inside the database container; removing it would mean exposing the database or adding a privileged sidecar.",
+      "expires": "2027-03-31"
     }
   ]
 }
