@@ -73,13 +73,38 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: [ALL]
+          # Memory sized for the worst query shape, not the idle footprint.
+          #
+          # A dedup read is a ROW_NUMBER() window over everything matching the
+          # filter, so its peak scales with dataset size and with how many such
+          # reads are in flight -- not with the size of the result. Idle usage
+          # is ~150 MiB and a single read's peak was ~300 MiB, but a handful of
+          # concurrent dedup reads over the 2M-row quotes dataset exhausted the
+          # old 1536Mi limit and the kernel OOM-killed the database five times
+          # (exit 137). A single-replica store going down takes the whole data
+          # tier with it, so the limit now carries real headroom.
+          #
+          # This is the containment, not the cure: the images also bound
+          # DuckDB's own query budget (MARKET_DATA_DB_DUCKDB_MEMORY_LIMIT) so a
+          # heavy query spills to disk instead of growing without limit. The
+          # higher ceiling is what keeps the pod alive if that budget is ever
+          # unset or too generous.
+          #
+          # 2Gi is the per-container ceiling the namespace LimitRange allows;
+          # going above it needs that policy raised too, which is not worth
+          # doing while the DuckDB budget is the real control.
+          #
+          # Costs nothing: memory is not separately billed on Always Free, the
+          # nodes carry ~8.6 GiB allocatable each, and requests -- which are
+          # what actually reserve capacity for the future AlgoT namespaces --
+          # are unchanged.
           resources:
             requests:
               cpu: 150m
               memory: 384Mi
             limits:
               cpu: "1"
-              memory: 1536Mi
+              memory: 2Gi
           # Startup probe carries the cold-start cost: first boot creates the
           # schema and metadata store. Up to 150s before giving up, which
           # keeps the liveness probe's own timeout tight afterwards.

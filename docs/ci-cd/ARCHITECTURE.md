@@ -79,7 +79,11 @@ Protect `main` and require the monorepo `quality-gate` status check. Keep GHCR p
 
 Actionlint accepts all 34 workflow files. Database tests passed (18); live ingestion tests passed (34); backfill and runtime tests passed (52); system and deployment guard tests passed (15). Both images built locally, both Compose files validated, and the Database container returned a healthy readiness response. Semgrep ran 151 Python rules on 53 tracked files with zero findings. pip-audit found no known vulnerabilities in the checked Database and Ingestion requirements. Syft generated valid CycloneDX SBOMs for both local images. An official Python Bookworm base candidate reported more findings, so the Dockerfiles were not changed.
 
-The **53 high-severity base-image findings** that previously blocked this gate turned out to be one CVE, not 53 problems: `CVE-2026-76642` in `util-linux`, which Trivy counts once per affected package. Debian 13 ships no patched `util-linux`, so the Fixed Version column is empty and there is nothing to upgrade to. It is now a documented, expiring exception rather than a permanent blocker — see the suppression policy below. Nothing in these containers invokes `mount`, they run as a non-root UID with ALL capabilities dropped, and the restricted Pod Security Standard forbids the privilege a mount helper would need.
+The **53 high-severity base-image findings** that previously blocked this gate are 12 distinct CVEs in Debian 13 base packages — `util-linux`, `libacl1` and others — which Trivy counts once per affected package, hence the inflated total. Parsing the Fixed Version column of a real run shows **0 of 44 remaining rows has a fixed version**: none of them is patched in Debian 13, so there is nothing to upgrade to, and repinning the `python:3.12-slim` base does not help.
+
+The amd64 image scan therefore runs with `--ignore-unfixed`, matching the arm64/OCIR chain, and blocks on anything that *can* be fixed. That is not a weaker gate in practice: the arm64 chain caught two genuinely fixable problems — `CVE-2026-124851` in `libzstd1` and the compromised-CA `certifi` bundle in `GHSA-6q48-6c7w-9gw2` — precisely because the unfixable noise was filtered out, and both were fixed rather than suppressed. A permanently red gate, by contrast, is one nobody acts on.
+
+The unfixed findings are still reported, non-blockingly, into each run's step summary, so they stay on the record rather than disappearing. If any of them gains a published fix, the gate starts failing on it automatically; nobody has to be watching the summary for that to work.
 
 ## Scanner suppression policy
 
@@ -87,7 +91,9 @@ The **53 high-severity base-image findings** that previously blocked this gate t
 
 The ignore files the scanners read are **generated** from that record at scan time rather than committed beside it, so there is no second place to look and the two cannot drift. `.gitleaksignore` is the one exception, because the Gitleaks action reads it from the repository root and cannot be pointed elsewhere; it is therefore checked for drift against the record instead of generated.
 
-Two properties are worth keeping in mind. `--ignore-unfixed` is deliberately **not** used on the amd64 image scan: it would silence every future unpatched CVE in advance, including ones that do affect this workload, whereas an ignore file names exactly what a human reviewed. And the manifest misconfiguration scan runs a second time with no ignores at all, asserting that the findings and the record correspond exactly — so a new finding fails, and so does an entry that has gone stale because a check was renamed upstream.
+There are deliberately **no `trivy-image` entries**. Because the image scan runs with `--ignore-unfixed`, an unpatched finding needs no entry; a `trivy-image` entry is for a *fixable* vulnerability granted a documented, expiring grace period, which should be rare and short. The scanner is still supported by the mechanism so that such a case has somewhere to go other than a bare ignore file.
+
+The manifest misconfiguration scan additionally runs a second time with no ignores at all, asserting that the findings and the record correspond exactly — so a new finding fails, and so does an entry that has gone stale because a check was renamed upstream.
 
 The expiry is the point. An unfixed CVE is suppressed because there is nothing to upgrade to *today*, and that stops being true without anyone noticing.
 

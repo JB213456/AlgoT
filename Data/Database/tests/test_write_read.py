@@ -52,3 +52,47 @@ def test_get_latest(db):
     latest = db.get_latest(Dataset.BARS, "MSFT")
     assert latest is not None
     assert latest["close"] == 52.0
+
+
+def _trade(i, ts, symbol="AAPL"):
+    return {
+        "symbol": symbol,
+        "asset_class": "equity",
+        "timestamp": ts,
+        "price": 100.0 + i,
+        "size": 1.0,
+        "exchange": "X",
+        "trade_id": f"t{i}-{symbol}",
+        "conditions": None,
+        "tape": "C",
+    }
+
+
+def test_write_accepts_mixed_subsecond_precision(db):
+    """A batch mixing whole-second and sub-second ISO timestamps must write.
+
+    pandas infers one strptime format from the first element unless told to
+    parse ISO8601 per element, so this used to fail for the whole batch
+    depending on which row happened to come first.
+    """
+    stamps = [
+        "2026-02-02T14:30:00+00:00",         # whole second first
+        "2026-02-02T14:30:00.100000+00:00",  # then sub-second
+        "2026-02-02T14:30:01.5+00:00",       # then a different precision
+        "2026-02-02T14:30:02Z",              # then Z-suffixed whole second
+    ]
+    records = [_trade(i, ts) for i, ts in enumerate(stamps)]
+    assert db.write(Dataset.TRADES, records, provider="p", source="backfill") == 4
+
+    out = db.read(Dataset.TRADES, symbols=["AAPL"], dedup=None)
+    assert len(out) == 4
+    assert sorted(int(t.microsecond) for t in out["timestamp"]) == [0, 0, 100000, 500000]
+
+
+def test_write_accepts_subsecond_first(db):
+    """Order must not matter: sub-second first, whole second later."""
+    records = [
+        _trade(0, "2026-02-02T14:30:00.250000+00:00", symbol="MSFT"),
+        _trade(1, "2026-02-02T14:30:01+00:00", symbol="MSFT"),
+    ]
+    assert db.write(Dataset.TRADES, records, provider="p", source="backfill") == 2

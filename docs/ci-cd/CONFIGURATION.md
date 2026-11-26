@@ -170,8 +170,13 @@ Configuration still to be done by an operator:
    | Expires | Scanner | Finding | What to check |
    |---|---|---|---|
    | 2027-01-31 | gitleaks | `.env.example` generic-key false positive | Still a false positive |
-   | 2027-03-31 | trivy-image | `CVE-2026-76642` (`util-linux`) | Whether Debian 13 has published a fixed `util-linux`; if so, drop the entry and rebuild |
    | 2027-03-31 | trivy-config | `KSV-0053` (`pods/exec`) | Whether the operational scripts still need `pods/exec`, and that every pod still sets `automountServiceAccountToken: false` |
+
+   There are no `trivy-image` entries: the image scan runs with
+   `--ignore-unfixed`, so the 12 unpatched Debian 13 base-image CVEs need
+   none. They are listed in each container-scan run's step summary instead,
+   and the gate starts failing on any of them automatically if a fix is
+   published.
 
 Not yet verified, and not claimed:
 

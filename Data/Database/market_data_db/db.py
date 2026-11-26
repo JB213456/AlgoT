@@ -15,7 +15,7 @@ from .metadata.engine import make_engine, make_session_factory
 from .metadata.models import Coverage, IngestionRun
 from .schema import Dataset, DatasetSpec, get_spec
 from .storage import parquet_store
-from .timestamps import now_utc
+from .timestamps import now_utc, parse_utc_series
 
 RecordsLike = Sequence[Mapping[str, Any]] | pd.DataFrame | pa.Table
 
@@ -99,9 +99,9 @@ class MarketDataDB:
             if field.name not in df.columns:
                 raise ValueError(f"missing required column '{field.name}' for dataset {spec.name.value}")
             if pa.types.is_timestamp(field.type):
-                df[field.name] = pd.to_datetime(df[field.name], utc=True)
+                df[field.name] = parse_utc_series(df[field.name])
             elif pa.types.is_date32(field.type):
-                df[field.name] = pd.to_datetime(df[field.name]).dt.date
+                df[field.name] = parse_utc_series(df[field.name]).dt.date
 
         df = df[[f.name for f in spec.schema]]
         return pa.Table.from_pandas(df, schema=spec.schema, preserve_index=False)

@@ -14,6 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from ..config import DBConfig, connect_duckdb
+from ..timestamps import parse_utc_series
 from ..paths import archive_root, partition_dir
 from ..schema import Dataset, DatasetSpec, get_spec
 from .lock import partition_lock
@@ -27,7 +28,7 @@ class WriteResult:
 
 
 def _partition_groups(df: pd.DataFrame, spec: DatasetSpec) -> Iterable[tuple[str | None, date, pd.DataFrame]]:
-    ts = pd.to_datetime(df[spec.time_col], utc=True)
+    ts = parse_utc_series(df[spec.time_col])
     df = df.copy()
     df["_date"] = ts.dt.date
     key_cols = ([spec.symbol_col] if spec.symbol_col else []) + ["_date"]

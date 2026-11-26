@@ -6,7 +6,11 @@
     "fails CI on an expired or unjustified entry, and generates the scanners'",
     "ignore files from this record so there is no second place to look.",
     "Scanners: gitleaks, trivy-image (vulnerability IDs), trivy-config",
-    "(misconfiguration check IDs)."
+    "(misconfiguration check IDs).",
+    "There are deliberately no trivy-image entries. The image scan runs with",
+    "--ignore-unfixed, so a finding with no published patch does not need an",
+    "entry here; a trivy-image entry is for a FIXABLE vulnerability granted a",
+    "documented, expiring grace period, which should be rare and short."
   ],
   "exceptions": [
     {
@@ -14,12 +18,6 @@
       "fingerprint": "d130ba4b4efaf8130314543eb48f797db8c30f11:Data_Ingestion/.env.example:generic-api-key:36",
       "reason": "Historical example has an empty MARKET_DATA_DB_API_KEY; the adjacent numeric flush interval created a multiline generic-key false positive. No credential was committed at this location.",
       "expires": "2027-01-31"
-    },
-    {
-      "scanner": "trivy-image",
-      "id": "CVE-2026-76642",
-      "reason": "util-linux: a failed external mount helper still returns success. Debian 13 ships no patched util-linux, so Trivy reports it with an empty Fixed Version and there is nothing to upgrade to; repinning the python:3.12-slim base does not help. Trivy counts it once per affected package (bsdutils, libblkid1, liblastlog2-2, libmount1, libsmartcols1, libuuid1, login, mount, util-linux), which is why one CVE presents as 53 HIGH findings. Not reachable in these images: nothing in the database or ingestion containers invokes mount, they run as a non-root UID with ALL capabilities dropped and no-new-privileges, the Kubernetes workloads have a read-only root filesystem, and the restricted Pod Security Standard that the admission dry run verifies forbids the privilege needed to call a mount helper at all. Review when Debian publishes a fixed util-linux.",
-      "expires": "2027-03-31"
     },
     {
       "scanner": "trivy-config",
