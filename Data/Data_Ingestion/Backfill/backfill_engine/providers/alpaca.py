@@ -61,6 +61,24 @@ class AlpacaProvider(Provider):
             raise DatasetUnavailable(f"alpaca {path}: 403 forbidden on free tier ({response.text[:200]})")
         if response.status_code == 404:
             raise DatasetUnavailable(f"alpaca {path}: 404 not found")
+        # 400 means this endpoint will not serve this request, whatever we do:
+        # retrying cannot help, and the symbol or range is simply not
+        # available here. That is exactly what DatasetUnavailable means, and
+        # the engine already degrades a single dataset gracefully while
+        # recording the reason in RunStats.error.
+        #
+        # Previously a 400 escaped as a raw httpx.HTTPStatusError and aborted
+        # the whole run. Observed in production: a plain equity backfill of
+        # AAPL fetched and wrote all its bars, then reached the options-bars
+        # stage, got a 400 for an OCC contract symbol, and failed the entire
+        # Job -- discarding the completed equity work from the run's point of
+        # view and re-running it on every retry. The response body is kept in
+        # the message so a genuine request-construction bug is still
+        # diagnosable from the log rather than silently swallowed.
+        if response.status_code == 400:
+            raise DatasetUnavailable(
+                f"alpaca {path}: 400 rejected request ({response.text[:200]})"
+            )
         response.raise_for_status()
         return response.json()
 

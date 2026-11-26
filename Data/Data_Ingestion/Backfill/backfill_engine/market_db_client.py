@@ -174,10 +174,26 @@ _TYPE_DISPATCH = {
 
 
 class MarketDBClient:
-    def __init__(self, base_url: str, api_key: str, max_retries: int = 5, retry_base_delay: float = 1.0) -> None:
-        self._client = httpx.AsyncClient(base_url=base_url, headers={"X-API-Key": api_key}, timeout=30.0)
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        max_retries: int = 5,
+        retry_base_delay: float = 1.0,
+        max_batch_rows: int | None = None,
+    ) -> None:
+        self._client = httpx.AsyncClient(base_url=base_url, headers={"X-API-Key": api_key}, timeout=60.0)
         self._max_retries = max_retries
         self._retry_base_delay = retry_base_delay
+        # Rows per write request. The database accepts a whole batch in one
+        # call, so this trades a little request memory for far fewer round
+        # trips (see ingest_many).
+        if max_batch_rows is None:
+            try:
+                max_batch_rows = int(os.environ.get("BACKFILL_DB_WRITE_BATCH_ROWS", "1000"))
+            except ValueError:
+                max_batch_rows = 1000
+        self._max_batch_rows = max(1, max_batch_rows)
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -204,34 +220,68 @@ class MarketDBClient:
         response.raise_for_status()
         return response.json().get("rows_written", len(records))
 
-    async def ingest_record(self, obj: Any) -> int:
+    def _explode(self, obj: Any) -> list[tuple[str, str, list[dict]]]:
+        """Map one provider object to (dataset, provider, records) groups."""
         cls_name = type(obj).__name__
         provider = _provider_key(obj)
 
         if cls_name == "OptionContract":
-            rows = await self._write("options_quotes", [_option_contract_to_quote_record(obj)], provider)
+            groups = [("options_quotes", provider, [_option_contract_to_quote_record(obj)])]
             greeks = _option_contract_to_greeks_record(obj)
             if greeks is not None:
-                rows += await self._write("options_greeks", [greeks], provider)
-            return rows
+                groups.append(("options_greeks", provider, [greeks]))
+            return groups
 
         if cls_name == "FundamentalRecord":
             dataset, records = _fundamental_to_records(obj)
-            return await self._write(dataset, records, provider)
+            return [(dataset, provider, records)]
 
         if cls_name not in _TYPE_DISPATCH:
             raise TypeError(f"no market_data_db wire mapping for record type {cls_name!r}")
         dataset, converter = _TYPE_DISPATCH[cls_name]
-        return await self._write(dataset, [converter(obj)], provider)
+        return [(dataset, provider, [converter(obj)])]
+
+    async def ingest_record(self, obj: Any) -> int:
+        total = 0
+        for dataset, provider, records in self._explode(obj):
+            total += await self._write(dataset, records, provider)
+        return total
 
     async def ingest_many(self, records: Iterable[Any]) -> int:
+        """Write many records, batched per (dataset, provider).
+
+        One HTTP request per record was the dominant cost of a backfill: a
+        single provider page of 475 bars became 475 sequential POSTs, each
+        paying a full request/response round trip, so the backfill ran at
+        roughly the reciprocal of the network latency (~34 rows/s measured
+        in-cluster) no matter how fast either side actually was. The write
+        endpoint already takes a list, so batching is nearly free.
+
+        Records are grouped by (dataset, provider) because that pair is what a
+        request is keyed on, and a mixed stream (bars plus trades plus quotes)
+        must not be merged into one call. Each group is flushed once it reaches
+        max_batch_rows, so memory stays bounded on an arbitrarily long stream.
+
+        Failure semantics are unchanged: exceptions propagate, and coverage
+        advances only if the whole stream was accepted. As before, a failure
+        part-way can leave earlier batches written -- the retry re-sends them
+        and the store's primary-key dedup absorbs the overlap.
+        """
         await self.assert_backfill_capacity()
+        pending: dict[tuple[str, str], list[dict]] = {}
         total = 0
+
         for rec in records:
-            # Coverage must advance only after the independent database has
-            # accepted every record. Propagate failures so the backfill can
-            # retry the same range after a database interruption.
-            total += await self.ingest_record(rec)
+            for dataset, provider, recs in self._explode(rec):
+                buf = pending.setdefault((dataset, provider), [])
+                buf.extend(recs)
+                if len(buf) >= self._max_batch_rows:
+                    total += await self._write(dataset, buf, provider)
+                    pending[(dataset, provider)] = []
+
+        for (dataset, provider), buf in pending.items():
+            if buf:
+                total += await self._write(dataset, buf, provider)
         return total
 
 

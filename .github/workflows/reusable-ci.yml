@@ -45,7 +45,16 @@ jobs:
         env:
           SERVICE: ${{ inputs.service }}
         run: |
+          # Data/Database/tests/integration holds the IN-CLUSTER suite: those
+          # files are mounted into a pod as a ConfigMap by
+          # run-database-integration-tests.sh and expect the deployed
+          # container's filesystem (/scratch, the mounted data volume) and a
+          # reachable database Service. restore_isolation_test.py matches
+          # pytest's *_test.py pattern, so it was collected here and failed
+          # on a missing /scratch -- a false failure that said nothing about
+          # the code. The deployment workflow exercises it against the real
+          # cluster instead.
           case "$SERVICE" in
-            database) python -m pytest -q Data/Database/tests ;;
+            database) python -m pytest -q Data/Database/tests --ignore=Data/Database/tests/integration ;;
             ingestion) python -m pytest -q Data/Data_Ingestion/Live/live_ingestion/tests Data/Data_Ingestion/Backfill/backfill_engine/tests Data/Data_Ingestion/ingestion_runtime/tests ;;
           esac

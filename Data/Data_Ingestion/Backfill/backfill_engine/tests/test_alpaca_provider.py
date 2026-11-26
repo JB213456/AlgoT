@@ -76,3 +76,21 @@ async def test_crypto_symbol_uses_crypto_endpoint():
             assert len(pages) == 1
     finally:
         await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_400_degrades_dataset_instead_of_aborting_run():
+    """A 400 must surface as DatasetUnavailable so one dataset cannot kill the run."""
+    provider = AlpacaProvider(api_key="k", secret_key="s", max_retries=0, retry_base_delay=0.01)
+    try:
+        with respx.mock(base_url="https://data.alpaca.markets") as mock:
+            mock.get("/v1beta1/options/bars").mock(
+                return_value=Response(400, text='{"message":"invalid symbol"}'))
+            with pytest.raises(DatasetUnavailable) as exc:
+                async for _ in provider.fetch_option_bars("AAPL  261127C00110000", "1Day",
+                                                          "2026-11-10", "2026-11-14"):
+                    pass
+            assert "400" in str(exc.value)
+            assert "invalid symbol" in str(exc.value)
+    finally:
+        await provider.close()
