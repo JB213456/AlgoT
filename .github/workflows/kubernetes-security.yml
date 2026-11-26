@@ -93,12 +93,66 @@ jobs:
       # A second opinion from a different rule set. Trivy and Checkov
       # disagree often enough that running both is worthwhile; config
       # scanning needs no vulnerability database, so this is cheap.
+      # Ignores live in kubernetes/.trivyignore, next to the manifests, with
+      # the reason for each recorded, so a local run evaluates exactly what
+      # CI evaluates.
       - name: Trivy
         run: |
           trivy config /tmp/rendered-k8s \
             --severity HIGH,CRITICAL \
             --exit-code 1 \
+            --ignorefile kubernetes/.trivyignore \
             --format table
+
+      # An ignore file silently stops matching if an ID is renamed upstream,
+      # which would turn a recorded exception into an unnoticed failure --
+      # or, worse, hide a real finding behind a stale entry. So the scan is
+      # run once more with no ignores: it must report exactly the findings
+      # the ignore file claims to cover, and nothing else.
+      - name: Confirm the ignore file still matches what it claims
+        run: |
+          trivy config /tmp/rendered-k8s \
+            --severity HIGH,CRITICAL \
+            --format json > /tmp/trivy-all.json
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+
+          report = json.loads(pathlib.Path("/tmp/trivy-all.json").read_text())
+          found = {
+              m["ID"]
+              for result in report.get("Results") or []
+              for m in result.get("Misconfigurations") or []
+              if m.get("Status") == "FAIL"
+          }
+
+          text = pathlib.Path("kubernetes/.trivyignore").read_text()
+          listed = {
+              line.strip()
+              for line in text.splitlines()
+              if line.strip() and not line.lstrip().startswith("#")
+          }
+          # The file lists several spellings of each ID on purpose; compare
+          # on a normalised form so that is not mistaken for extra entries.
+          norm = lambda s: re.sub(r"[^A-Z0-9]", "", s.upper()).removeprefix("AVD")
+          listed_norm = {norm(x) for x in listed}
+          found_norm = {norm(x) for x in found}
+
+          print("findings with no ignore:", sorted(found) or "none")
+          print("ignored IDs:", sorted(listed))
+
+          unexpected = found_norm - listed_norm
+          if unexpected:
+              sys.exit(f"::error::new HIGH/CRITICAL finding(s) not covered by "
+                       f".trivyignore: {sorted(unexpected)}")
+
+          stale = listed_norm - found_norm
+          if stale:
+              sys.exit(f"::error::.trivyignore lists {sorted(stale)}, which no "
+                       f"longer matches any finding. Remove the entry, or fix "
+                       f"the ID if the check was renamed upstream.")
+
+          print("The ignore file matches the findings exactly.")
+          PY
 
   pod-security-admission:
     name: Restricted Pod Security Standard dry run

@@ -44,26 +44,25 @@ jobs:
           RESULTS: ${{ needs.ci.result }},${{ needs.data.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs['container-security'].result }},${{ needs.performance.result }}
         run: |
           test "$RESULTS" = 'success,success,success,success,success,success'
-  delivery:
-    needs: quality-gate
-    if: vars.INGESTION_RELEASE_ENABLED == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ingestion-v')
-    uses: ./.github/workflows/ingestion-delivery.yml
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    with:
-      release: true
-  staging:
-    needs: delivery
-    if: needs.delivery.result == 'success'
-    uses: ./.github/workflows/ingestion-staging.yml
-    with:
-      image: ${{ needs.delivery.outputs.image }}
-  production:
-    needs: [delivery, staging]
-    if: needs.staging.result == 'success'
-    uses: ./.github/workflows/ingestion-production.yml
-    with:
-      image: ${{ needs.delivery.outputs.image }}
+
+# This pipeline deliberately ends at the quality gate. It used to continue
+# into delivery, staging and production, and that was wrong twice over.
+#
+# Those jobs were unreachable. This workflow is entered only through
+# workflow_call (from monorepo-pipeline) or workflow_dispatch, and they
+# required `github.event_name == 'push'` with a ref under
+# refs/tags/ingestion-v. monorepo-pipeline does not trigger on tags, so the
+# condition could never hold and the release path never ran from here.
+#
+# They also broke the dispatcher outright. A called job cannot be granted
+# more permission than its caller holds, and the delivery job requested
+# packages, id-token and attestations write while monorepo-pipeline grants
+# only `contents: read`. GitHub validates that statically, before any `if:`
+# is evaluated, so every monorepo-pipeline run failed at startup -- which is
+# how this was found.
+#
+# Release remains a separate, explicitly authorised dispatch:
+# ingestion-release.yml holds the elevated permissions itself and requires
+# INGESTION_RELEASE_ENABLED and GHCR_PRIVATE_CONFIRMED. Keeping it there is
+# also what lets this pipeline -- the one that runs on every pull request --
+# stay read-only.
