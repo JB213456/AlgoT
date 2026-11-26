@@ -1,0 +1,126 @@
+name: Monorepo CI dispatcher
+on:
+  pull_request:
+    paths:
+      - 'Data/Database/**'
+      - 'Data/Data_Ingestion/**'
+      - 'system_tests/**'
+      - 'deployment/**'
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - 'Core/Feature_Engineering/**'
+      - 'Core/Signal_Aggregator/**'
+      - 'Core/Portfolio_Manager/**'
+      - 'Core/Risk_Management/**'
+      - 'Core/Execution_Engine/**'
+  push:
+    branches: [main]
+    paths:
+      - 'Data/Database/**'
+      - 'Data/Data_Ingestion/**'
+      - 'system_tests/**'
+      - 'deployment/**'
+      - '.github/workflows/**'
+      - '.github/actions/**'
+      - 'Core/Feature_Engineering/**'
+      - 'Core/Signal_Aggregator/**'
+      - 'Core/Portfolio_Manager/**'
+      - 'Core/Risk_Management/**'
+      - 'Core/Execution_Engine/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: monorepo-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      database: ${{ steps.detect.outputs.database }}
+      ingestion: ${{ steps.detect.outputs.ingestion }}
+      system: ${{ steps.detect.outputs.system }}
+      features: ${{ steps.detect.outputs.features }}
+      aggregator: ${{ steps.detect.outputs.aggregator }}
+      portfolio: ${{ steps.detect.outputs.portfolio }}
+      risk: ${{ steps.detect.outputs.risk }}
+      execution: ${{ steps.detect.outputs.execution }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - id: detect
+        uses: ./.github/actions/change-detection
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+          head: ${{ github.sha }}
+  database:
+    needs: changes
+    if: needs.changes.outputs.database == 'true'
+    uses: ./.github/workflows/database-pipeline.yml
+  ingestion:
+    needs: changes
+    if: needs.changes.outputs.ingestion == 'true'
+    uses: ./.github/workflows/ingestion-pipeline.yml
+  features:
+    needs: changes
+    if: needs.changes.outputs.features == 'true'
+    uses: ./.github/workflows/features-pipeline.yml
+  aggregator:
+    needs: changes
+    if: needs.changes.outputs.aggregator == 'true'
+    uses: ./.github/workflows/aggregator-pipeline.yml
+  portfolio:
+    needs: changes
+    if: needs.changes.outputs.portfolio == 'true'
+    uses: ./.github/workflows/portfolio-pipeline.yml
+  risk:
+    needs: changes
+    if: needs.changes.outputs.risk == 'true'
+    uses: ./.github/workflows/risk-pipeline.yml
+  execution:
+    needs: changes
+    if: needs.changes.outputs.execution == 'true'
+    uses: ./.github/workflows/execution-pipeline.yml
+  system:
+    needs: [changes, database, ingestion]
+    if: always() && needs.changes.outputs.system == 'true' && (needs.database.result == 'success' || needs.database.result == 'skipped') && (needs.ingestion.result == 'success' || needs.ingestion.result == 'skipped')
+    uses: ./.github/workflows/system-integration.yml
+    with:
+      prevalidated: true
+  quality-gate:
+    if: always()
+    needs: [changes, database, ingestion, system, features, aggregator, portfolio, risk, execution]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every affected service and compatibility check
+        env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          DATABASE_AFFECTED: ${{ needs.changes.outputs.database }}
+          INGESTION_AFFECTED: ${{ needs.changes.outputs.ingestion }}
+          SYSTEM_AFFECTED: ${{ needs.changes.outputs.system }}
+          FEATURES_AFFECTED: ${{ needs.changes.outputs.features }}
+          FEATURES_RESULT: ${{ needs.features.result }}
+          AGGREGATOR_AFFECTED: ${{ needs.changes.outputs.aggregator }}
+          AGGREGATOR_RESULT: ${{ needs.aggregator.result }}
+          PORTFOLIO_AFFECTED: ${{ needs.changes.outputs.portfolio }}
+          PORTFOLIO_RESULT: ${{ needs.portfolio.result }}
+          RISK_AFFECTED: ${{ needs.changes.outputs.risk }}
+          RISK_RESULT: ${{ needs.risk.result }}
+          EXECUTION_AFFECTED: ${{ needs.changes.outputs.execution }}
+          EXECUTION_RESULT: ${{ needs.execution.result }}
+          DATABASE_RESULT: ${{ needs.database.result }}
+          INGESTION_RESULT: ${{ needs.ingestion.result }}
+          SYSTEM_RESULT: ${{ needs.system.result }}
+        run: |
+          test "$CHANGES_RESULT" = success
+          test "$DATABASE_AFFECTED" != true || test "$DATABASE_RESULT" = success
+          test "$INGESTION_AFFECTED" != true || test "$INGESTION_RESULT" = success
+          test "$SYSTEM_AFFECTED" != true || test "$SYSTEM_RESULT" = success
+          test "$FEATURES_AFFECTED" != true || test "$FEATURES_RESULT" = success
+          test "$AGGREGATOR_AFFECTED" != true || test "$AGGREGATOR_RESULT" = success
+          test "$PORTFOLIO_AFFECTED" != true || test "$PORTFOLIO_RESULT" = success
+          test "$RISK_AFFECTED" != true || test "$RISK_RESULT" = success
+          test "$EXECUTION_AFFECTED" != true || test "$EXECUTION_RESULT" = success

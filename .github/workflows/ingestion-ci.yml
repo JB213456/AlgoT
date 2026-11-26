@@ -14,19 +14,19 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: Data_Ingestion/ci-requirements.txt
+          cache-dependency-path: Data/Data_Ingestion/ci-requirements.txt
       - name: Install locked test dependencies
-        run: python -m pip install -r Data_Ingestion/ci-requirements.txt
+        run: python -m pip install -r Data/Data_Ingestion/ci-requirements.txt
       - name: Install local packages without dependency resolution
-        run: python -m pip install --no-deps -e Data_Ingestion/Live -e Data_Ingestion/Backfill -e Data_Ingestion
+        run: python -m pip install --no-deps -e Data/Data_Ingestion/Live -e Data/Data_Ingestion/Backfill -e Data/Data_Ingestion
       - name: Syntax and compile
-        run: python -m compileall -q Data_Ingestion/Live Data_Ingestion/Backfill Data_Ingestion/ingestion_runtime
+        run: python -m compileall -q Data/Data_Ingestion/Live Data/Data_Ingestion/Backfill Data/Data_Ingestion/ingestion_runtime
       - name: Lint and formatting
         run: |
-          ruff check Data_Ingestion/Live/live_ingestion Data_Ingestion/Backfill/backfill_engine Data_Ingestion/ingestion_runtime
-          ruff format --check Data_Ingestion/Live/live_ingestion Data_Ingestion/Backfill/backfill_engine Data_Ingestion/ingestion_runtime
+          ruff check Data/Data_Ingestion/Live/live_ingestion Data/Data_Ingestion/Backfill/backfill_engine Data/Data_Ingestion/ingestion_runtime
+          ruff format --check Data/Data_Ingestion/Live/live_ingestion Data/Data_Ingestion/Backfill/backfill_engine Data/Data_Ingestion/ingestion_runtime
       - name: Static types
-        run: mypy --follow-imports=silent --ignore-missing-imports Data_Ingestion/ingestion_runtime
+        run: mypy --follow-imports=silent --ignore-missing-imports Data/Data_Ingestion/ingestion_runtime
       - name: Mocked unit, integration and regression tests with coverage
         run: |
-          pytest -q Data_Ingestion/Live/live_ingestion/tests Data_Ingestion/Backfill/backfill_engine/tests Data_Ingestion/ingestion_runtime/tests --cov=live_ingestion --cov=backfill_engine --cov=ingestion_runtime --cov-report=term-missing --cov-fail-under=70
+          pytest -q Data/Data_Ingestion/Live/live_ingestion/tests Data/Data_Ingestion/Backfill/backfill_engine/tests Data/Data_Ingestion/ingestion_runtime/tests --cov=live_ingestion --cov=backfill_engine --cov=ingestion_runtime --cov-report=term-missing --cov-fail-under=70

@@ -1,0 +1,24 @@
+name: Shared performance checks
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  baseline:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Run bounded local baseline
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          case "$SERVICE" in
+            database) python -m pip install -c Data/Database/constraints.lock -e './Data/Database[server,dev]' && python -m pytest -q Data/Database/tests/test_concurrency.py ;;
+            ingestion) python -m pip install -r Data/Data_Ingestion/ci-requirements.txt && python -m pip install --no-deps -e Data/Data_Ingestion/Live -e Data/Data_Ingestion/Backfill -e Data/Data_Ingestion && python Data/Data_Ingestion/ci/benchmark.py ;;
+            *) exit 1 ;;
+          esac

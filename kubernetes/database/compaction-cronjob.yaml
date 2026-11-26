@@ -1,0 +1,83 @@
+# Nightly landing-zone compaction.
+#
+# write() is append-only: every batch lands as a new file and reads
+# deduplicate by primary key, so correctness never depends on this job.
+# What it protects is capacity. Two sources append duplicate physical rows
+# continuously:
+#
+#   * live ingestion flushes every 5s, so a symbol/day partition accumulates
+#     thousands of small landing-zone files;
+#   * resumable backfills re-fetch the boundary period of an already-covered
+#     range (the coverage checkpoint is inclusive), rewriting those rows on
+#     every resumed run.
+#
+# Left uncompacted the landing zone grows without bound on an 80 GB volume
+# that cannot be expanded without leaving the Always Free tier, and read
+# latency degrades with the file count. compact() merges each partition into
+# one deduplicated canonical file and physically removes the duplicates.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: market-data-db-compaction
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: market-data-db-compaction
+    app.kubernetes.io/part-of: algot
+spec:
+  # 03:30 UTC daily: after the US cash session closes and the backfill
+  # window, and well clear of the 02:15 Sunday backup so the two never
+  # contend for the same partitions.
+  schedule: "30 3 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  startingDeadlineSeconds: 3600
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 7200
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: market-data-db-compaction
+            algot.io/role: maintenance
+            algot.io/database-client: "true"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: algot-maintenance
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            fsGroup: 10001
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: compaction
+              image: __TOOLBOX_IMAGE__
+              command: [/bin/sh, /scripts/compact-datasets.sh]
+              env:
+                - name: HOME
+                  value: /tmp
+                - name: DB_URL
+                  value: http://market-data-db.algot-data.svc.cluster.local:8000
+              envFrom:
+                - secretRef:
+                    name: market-data-db-client
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: [ALL] }
+              resources:
+                requests: { cpu: 50m, memory: 128Mi }
+                limits: { cpu: 500m, memory: 512Mi }
+              volumeMounts:
+                - { name: scripts, mountPath: /scripts, readOnly: true }
+                - { name: tmp, mountPath: /tmp }
+          volumes:
+            - name: scripts
+              configMap: { name: maintenance-scripts, defaultMode: 0555 }
+            - name: tmp
+              emptyDir: { sizeLimit: 256Mi }

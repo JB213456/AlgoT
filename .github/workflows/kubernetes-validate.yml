@@ -1,0 +1,59 @@
+name: Kubernetes manifest validation
+# No cluster access and no credentials: safe for pull requests from forks.
+on:
+  pull_request:
+    paths:
+      - 'kubernetes/**'
+      - 'deployment/**'
+      - '.github/workflows/kubernetes-validate.yml'
+  push:
+    branches: [main]
+    paths: ['kubernetes/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: k8s-validate-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  schema:
+    name: Schema validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install kubeconform
+        run: |
+          curl -fsSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp kubeconform
+          sudo install -m 0755 /tmp/kubeconform /usr/local/bin/kubeconform
+
+      # Placeholders are substituted at deploy time; the shared render script
+      # swaps in syntactically valid stand-ins so the schema check sees
+      # well-formed manifests. It is the same rendering the security scan
+      # uses, so the two jobs cannot drift apart.
+      - name: Render the manifests
+        run: bash deployment/scripts/render-placeholders.sh /tmp/rendered
+
+      - name: Validate manifests against the cluster's Kubernetes version
+        run: |
+          kubeconform -strict -summary -kubernetes-version 1.34.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /tmp/rendered/
+
+  policy:
+    name: Manifest policy checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      # Asserts the cost and security invariants that schema validation
+      # cannot: no billable Service types, no mutable image tags, Pod
+      # Security Standards satisfied, and explicit resource limits.
+      - run: python3 deployment/scripts/validate-k8s-manifests.py kubernetes

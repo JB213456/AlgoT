@@ -1,3 +1,8 @@
-/Data_Ingestion/ @JB213456
+/Data/Data_Ingestion/ @JB213456
 /.github/workflows/ingestion-*.yml @JB213456
 /.github/dependabot.yml @JB213456
+
+/Data/Database/ @JB213456
+/.github/workflows/ @JB213456
+/.github/actions/ @JB213456
+/deployment/ @JB213456

@@ -9,20 +9,12 @@ permissions:
   contents: read
 jobs:
   deploy:
-    if: vars.INGESTION_STAGING_ENABLED == 'true'
-    runs-on: [self-hosted, ingestion-staging]
-    environment: ingestion-staging
-    timeout-minutes: 30
-    concurrency: ingestion-staging
-    steps:
-      - name: Require immutable digest and isolated target
-        env:
-          IMAGE: ${{ inputs.image }}
-          TARGET: ${{ vars.INGESTION_STAGING_DB_URL }}
-        run: |
-          [[ "$IMAGE" =~ @sha256:[a-f0-9]{64}$ ]]
-          [[ "$TARGET" == *staging* ]]
-      - name: Deploy validated digest
-        env:
-          IMAGE: ${{ inputs.image }}
-        run: /opt/algot-ingestion/deploy.sh staging "$IMAGE"
+    uses: ./.github/workflows/reusable-deployment.yml
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    with:
+      service: ingestion
+      target: staging
+      image: ${{ inputs.image }}

@@ -1,0 +1,195 @@
+name: Infrastructure apply
+# Manual dispatch only, behind an environment that must require reviewer
+# approval. There is no automatic path from a commit to applied
+# infrastructure: requirement 9 calls for explicit authorisation of every
+# subsequent infrastructure change.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm'
+        required: true
+        type: string
+      allow_cluster_replacement:
+        description: 'Permit destroying/replacing the OKE cluster (needed only for a CNI change)'
+        required: false
+        default: false
+        type: boolean
+      allow_node_pool_replacement:
+        description: 'Permit recycling both worker nodes (replacing the node pool) -- this is an outage'
+        required: false
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  # Read-only, and only so the mandatory gates can be re-checked for the
+  # commit being applied.
+  actions: read
+concurrency:
+  group: algot-terraform-state
+  cancel-in-progress: false
+jobs:
+  apply:
+    name: Apply the reviewed plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # Configure this environment with required reviewers so an apply cannot
+    # proceed unattended.
+    environment: production-infrastructure
+    steps:
+      - name: Check the confirmation phrase
+        if: inputs.confirm != 'APPLY'
+        run: |
+          echo "::error::confirm must be exactly APPLY"
+          exit 1
+
+      - name: Require the deployment switch
+        if: vars.INFRASTRUCTURE_APPLY_ENABLED != 'true'
+        run: |
+          echo "::error::set the repository variable INFRASTRUCTURE_APPLY_ENABLED=true to allow applies"
+          exit 1
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # A dispatch can name any ref. The static Terraform gates -- fmt,
+      # validate, Checkov and the free-tier policy unit tests -- are
+      # re-checked against the exact commit being applied, so they cannot be
+      # bypassed by dispatching a ref that never passed them. The free-tier
+      # gate also runs again below against the live plan, which is the check
+      # that cannot be done statically.
+      - name: Require the infrastructure gates to have passed for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash deployment/scripts/require-green-gates.sh "${{ github.sha }}" \
+            infrastructure-validate.yml \
+            kubernetes-validate.yml \
+            kubernetes-security.yml
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.14.4
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - run: pip install oci-cli==3.97.1 pyyaml
+
+      - name: Write OCI credentials
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.oci
+          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/api_key.pem
+          chmod 600 ~/.oci/api_key.pem
+
+      - name: Acquire the state lock and pull state
+        env:
+          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/api_key.pem
+          OCI_CLI_REGION: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          OCI_CLI_AUTH: api_key
+        run: |
+          bash deployment/scripts/terraform-state.sh lock
+          bash deployment/scripts/terraform-state.sh pull
+
+      # The plan is regenerated here rather than trusted from an artifact:
+      # an artifact could be stale against live infrastructure, and applying
+      # a stale plan is how unintended destruction happens.
+      - name: Re-plan against current infrastructure
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          TF_VAR_user_ocid: ${{ secrets.OCI_USER_OCID }}
+          TF_VAR_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+          TF_VAR_private_key_path: /home/runner/.oci/api_key.pem
+          TF_VAR_oci_config_file_profile: 'null'
+          TF_VAR_region: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          TF_VAR_api_allowed_cidrs: ${{ vars.API_ALLOWED_CIDRS || '[]' }}
+        run: |
+          terraform -chdir=infrastructure/terraform init -input=false
+          terraform -chdir=infrastructure/terraform plan -input=false -out=plan.tfplan
+          terraform -chdir=infrastructure/terraform show -json plan.tfplan > infrastructure/terraform/plan.json
+
+      - name: Always Free compliance gate
+        env:
+          ALLOW_REPLACE: ${{ inputs.allow_cluster_replacement }}
+          ALLOW_POOL_REPLACE: ${{ inputs.allow_node_pool_replacement }}
+        run: |
+          ARGS=()
+          if [[ "$ALLOW_REPLACE" == "true" ]]; then
+            echo "::warning::cluster replacement permitted by dispatch input"
+            ARGS+=(--allow-cluster-replacement)
+          fi
+          if [[ "$ALLOW_POOL_REPLACE" == "true" ]]; then
+            echo "::warning::node pool replacement permitted by dispatch input: both workers will be recycled"
+            ARGS+=(--allow-node-pool-replacement)
+          fi
+          python3 infrastructure/terraform/policies/free-tier/check_plan.py \
+            infrastructure/terraform/plan.json \
+            --allowlist infrastructure/terraform/policies/free-tier/allowlist.yaml \
+            "${ARGS[@]}" | tee free-tier-report.txt
+
+      - name: Apply
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          TF_VAR_user_ocid: ${{ secrets.OCI_USER_OCID }}
+          TF_VAR_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+          TF_VAR_private_key_path: /home/runner/.oci/api_key.pem
+          TF_VAR_oci_config_file_profile: 'null'
+          TF_VAR_region: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          TF_VAR_api_allowed_cidrs: ${{ vars.API_ALLOWED_CIDRS || '[]' }}
+        run: terraform -chdir=infrastructure/terraform apply -input=false -auto-approve plan.tfplan
+
+      - name: Verify the applied state has no drift
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          TF_VAR_user_ocid: ${{ secrets.OCI_USER_OCID }}
+          TF_VAR_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+          TF_VAR_private_key_path: /home/runner/.oci/api_key.pem
+          TF_VAR_oci_config_file_profile: 'null'
+          TF_VAR_region: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          TF_VAR_api_allowed_cidrs: ${{ vars.API_ALLOWED_CIDRS || '[]' }}
+        run: |
+          # -detailed-exitcode: 0 = no changes, 2 = changes pending, 1 = error.
+          set +e
+          terraform -chdir=infrastructure/terraform plan -input=false -detailed-exitcode
+          code=$?
+          set -e
+          case "$code" in
+            0) echo "No drift: the applied state matches the configuration." ;;
+            2) echo "::warning::plan is not empty immediately after apply" ;;
+            *) echo "::error::drift check failed to run (exit $code)"; exit 1 ;;
+          esac
+
+      - name: Push state and release the lock
+        if: always()
+        env:
+          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/api_key.pem
+          OCI_CLI_REGION: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          OCI_CLI_AUTH: api_key
+        run: |
+          # State is pushed even on failure: a partial apply still changed
+          # real infrastructure and must be recorded.
+          bash deployment/scripts/terraform-state.sh push || true
+          bash deployment/scripts/terraform-state.sh unlock || true
+
+      - name: Report consumption
+        if: always()
+        run: |
+          {
+            echo '## Applied infrastructure'
+            echo '```'
+            cat free-tier-report.txt 2>/dev/null || echo 'gate report unavailable'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

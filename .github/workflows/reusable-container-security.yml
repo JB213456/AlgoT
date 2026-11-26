@@ -1,0 +1,38 @@
+name: Shared container validation and SBOM
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ${{ inputs.service }}-image
+          path: /tmp
+      - name: Install checksum-verified scanners
+        run: bash deployment/scripts/install-security-tools.sh
+      - name: Load and inspect exact candidate image
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          case "$SERVICE" in database|ingestion) ;; *) exit 1 ;; esac
+          docker load -i "/tmp/$SERVICE-image.tar"
+          if [ "$SERVICE" = database ]; then IMAGE="algot-database:${{ github.sha }}"; else IMAGE="ingestion-candidate:${{ github.sha }}"; fi
+          test -n "$(docker image inspect "$IMAGE" --format '{{.Config.User}}')"
+          trivy image --exit-code 1 --severity HIGH,CRITICAL --scanners vuln "$IMAGE"
+          syft "docker:$IMAGE" -o "cyclonedx-json=/tmp/$SERVICE-sbom.json"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["bomFormat"] == "CycloneDX" and d["components"]' "/tmp/$SERVICE-sbom.json"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ inputs.service }}-sbom
+          path: /tmp/${{ inputs.service }}-sbom.json
+          if-no-files-found: error
+          retention-days: 7

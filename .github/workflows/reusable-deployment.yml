@@ -1,0 +1,54 @@
+name: Controlled service deployment
+on:
+  workflow_call:
+    inputs:
+      service:
+        type: string
+        required: true
+      target:
+        type: string
+        required: true
+      image:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  deploy:
+    if: (inputs.target == 'staging' && vars.STAGING_DEPLOY_ENABLED == 'true') || (inputs.target == 'production' && vars.PRODUCTION_DEPLOY_ENABLED == 'true' && ((inputs.service == 'database' && vars.PRODUCTION_APPROVED_DATABASE_DIGEST == inputs.image) || (inputs.service == 'ingestion' && vars.PRODUCTION_APPROVED_INGESTION_DIGEST == inputs.image)))
+    runs-on: ${{ inputs.target == 'staging' && fromJSON('["self-hosted","ingestion-staging"]') || fromJSON('["self-hosted","ingestion-production"]') }}
+    environment: ${{ inputs.target }}
+    timeout-minutes: 30
+    concurrency: deploy-${{ inputs.target }}
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Validate service, target and image
+        env:
+          SERVICE: ${{ inputs.service }}
+          TARGET: ${{ inputs.target }}
+          IMAGE: ${{ inputs.image }}
+        run: |
+          case "$SERVICE" in database|ingestion) ;; *) exit 1 ;; esac
+          case "$TARGET" in staging|production) ;; *) exit 1 ;; esac
+          [[ "$IMAGE" =~ ^ghcr\.io/[a-z0-9_.-]+/algot-$SERVICE@sha256:[a-f0-9]{64}$ ]]
+      - name: Authenticate to private GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - name: Install verified Cosign
+        run: bash deployment/scripts/install-cosign.sh
+      - name: Verify signed approved digest
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          cosign verify --certificate-identity-regexp "^https://github.com/$GITHUB_REPOSITORY/.github/workflows/(reusable-publish|database-release|ingestion-release)\\.yml@refs/heads/main$" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE" >/dev/null
+      - name: Replace one service and verify health
+        env:
+          SERVICE: ${{ inputs.service }}
+          TARGET: ${{ inputs.target }}
+          IMAGE: ${{ inputs.image }}
+        run: bash deployment/scripts/deploy-service.sh "$SERVICE" "$TARGET" "$IMAGE"

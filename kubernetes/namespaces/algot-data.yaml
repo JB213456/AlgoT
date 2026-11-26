@@ -1,0 +1,97 @@
+# The algot-data namespace.
+#
+# Pod Security Standards are enforced at "restricted" -- the strictest
+# built-in level -- so every workload must run non-root, drop all
+# capabilities and forbid privilege escalation. Both images already comply
+# (uid 10001 and 10002 respectively).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: algot-data
+  labels:
+    app.kubernetes.io/part-of: algot
+    algot.io/tier: data
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+---
+# Caps what the data tier may consume so the future algot-strategies,
+# algot-core and algot-monitoring namespaces have guaranteed headroom on the
+# same two nodes. Cluster allocatable is roughly 3.6 CPU / 21 GiB after
+# kube-system reservations; this quota claims well under half of it.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: algot-data-quota
+  namespace: algot-data
+spec:
+  hard:
+    # requests are what actually reserve node capacity, so these are the
+    # numbers that protect headroom for the future namespaces: 1 of 4 OCPUs
+    # and 2 GiB of roughly 21 GiB allocatable.
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    # limits are burst ceilings, not reservations. They are set high enough
+    # that a backfill Job and a maintenance CronJob can be admitted at the
+    # same time as both long-running workloads; a tighter ceiling causes
+    # spurious admission failures without reserving anything.
+    #
+    # Budgeted against that invariant, worst case:
+    #   market-data-db                    1000m
+    #   data-ingestion (600 + 600)        1200m
+    #   backfill Job (500 + 200 + 500)    1200m
+    #   largest maintenance CronJob         500m
+    #                                     -----
+    #                                     3900m
+    # The old 3500m ceiling could not admit that combination: a backfill Job
+    # alongside the steady workloads and any maintenance CronJob exceeds it.
+    # The failure mode is not a throttle but a hard refusal -- "exceeded
+    # quota: limits.cpu" at admission, retried to backoffLimit and then
+    # abandoned, so the work silently never happens. 4500m restores the stated
+    # invariant with margin.
+    #
+    # This does not erode the headroom reserved for algot-strategies /
+    # algot-core / algot-monitoring: that is protected by requests.cpu above,
+    # which stays at 1 of ~3.6 allocatable OCPUs. Limits only govern burst,
+    # and the kubelet already runs these nodes with limits oversubscribed.
+    limits.cpu: "4500m"
+    limits.memory: 6Gi
+    pods: "12"
+    persistentvolumeclaims: "3"
+    services: "4"
+    # LoadBalancer Services are a billed OCI resource. Zero permitted.
+    services.loadbalancers: "0"
+    services.nodeports: "0"
+    count/cronjobs.batch: "4"
+---
+# Every container must carry explicit requests and limits; these defaults
+# apply when a manifest omits them, and the maximums stop one pod from
+# claiming the whole quota.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: algot-data-limits
+  namespace: algot-data
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 128Mi
+      max:
+        cpu: "1"
+        memory: 2Gi
+      min:
+        cpu: 10m
+        memory: 32Mi
+    - type: PersistentVolumeClaim
+      max:
+        storage: 80Gi
+      min:
+        storage: 1Gi

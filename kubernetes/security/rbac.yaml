@@ -1,0 +1,67 @@
+# Least-privilege Kubernetes RBAC for the data tier.
+#
+# Neither workload talks to the Kubernetes API, so both service accounts have
+# their API token projection disabled and are granted no permissions at all.
+# The only role that exists is for the backup CronJobs, which need to read
+# their own namespace's secrets to authenticate to the database API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: market-data-db
+  namespace: algot-data
+# The database never calls the Kubernetes API; withholding the token removes
+# it from the pod filesystem entirely.
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: data-ingestion
+  namespace: algot-data
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: algot-maintenance
+  namespace: algot-data
+automountServiceAccountToken: false
+---
+# Read-only view of the data tier for operators, with no access to secrets.
+# Bind this instead of cluster-admin for day-to-day inspection.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: algot-data-observer
+  namespace: algot-data
+rules:
+  - apiGroups: [""]
+    resources: [pods, pods/log, services, persistentvolumeclaims, events]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [statefulsets, deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [batch]
+    resources: [jobs, cronjobs]
+    verbs: [get, list, watch]
+  - apiGroups: [metrics.k8s.io]
+    resources: [pods, nodes]
+    verbs: [get, list]
+---
+# Permits starting a backfill Job and exec-ing the backfill CLI, without any
+# power to alter the database workload or read provider credentials.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: algot-data-backfill-operator
+  namespace: algot-data
+rules:
+  - apiGroups: [batch]
+    resources: [jobs]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods/exec]
+    verbs: [create]

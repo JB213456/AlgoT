@@ -14,12 +14,12 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: Data_Ingestion/ci-requirements.txt
+          cache-dependency-path: Data/Data_Ingestion/ci-requirements.txt
       - name: Install locked test dependencies
-        run: python -m pip install -r Data_Ingestion/ci-requirements.txt
+        run: python -m pip install -r Data/Data_Ingestion/ci-requirements.txt
       - name: Install local packages without dependency resolution
-        run: python -m pip install --no-deps -e Data_Ingestion/Live -e Data_Ingestion/Backfill -e Data_Ingestion
+        run: python -m pip install --no-deps -e Data/Data_Ingestion/Live -e Data/Data_Ingestion/Backfill -e Data/Data_Ingestion
       - name: Provider, schema, database and resumability contracts (mocked)
-        run: pytest -q Data_Ingestion/Backfill/backfill_engine/tests Data_Ingestion/Live/live_ingestion/tests/test_normalize.py Data_Ingestion/Live/live_ingestion/tests/test_dedup.py Data_Ingestion/ingestion_runtime/tests
+        run: pytest -q Data/Data_Ingestion/Backfill/backfill_engine/tests Data/Data_Ingestion/Live/live_ingestion/tests/test_normalize.py Data/Data_Ingestion/Live/live_ingestion/tests/test_dedup.py Data/Data_Ingestion/ingestion_runtime/tests
       - name: Check no paid feed configuration or order endpoints
-        run: python Data_Ingestion/ci/policy.py
+        run: python Data/Data_Ingestion/ci/policy.py

@@ -1,0 +1,40 @@
+name: Ingestion release
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Existing ingestion-vMAJOR.MINOR.PATCH tag version
+        required: true
+      sha:
+        description: Exact commit SHA validated by monorepo CI
+        required: true
+      run_id:
+        description: Successful monorepo CI run ID for that commit
+        required: true
+permissions:
+  contents: read
+jobs:
+  release:
+    if: vars.INGESTION_RELEASE_ENABLED == 'true' && vars.GHCR_PRIVATE_CONFIRMED == 'true'
+    uses: ./.github/workflows/reusable-publish.yml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+      id-token: write
+      attestations: write
+    with:
+      service: ingestion
+      version: ${{ inputs.version }}
+      sha: ${{ inputs.sha }}
+      run_id: ${{ inputs.run_id }}
+  staging:
+    needs: release
+    if: needs.release.result == 'success' && vars.STAGING_DEPLOY_ENABLED == 'true'
+    uses: ./.github/workflows/ingestion-staging.yml
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    with:
+      image: ${{ needs.release.outputs.image }}

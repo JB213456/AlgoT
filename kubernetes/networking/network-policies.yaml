@@ -1,0 +1,156 @@
+# Network isolation for algot-data.
+#
+# Enforcement requires Calico: OKE's VCN native CNI does not itself enforce
+# Kubernetes NetworkPolicy objects. deployment/scripts/
+# install-calico.sh installs Calico in policy-only mode, and
+# verify-network-policies.sh proves enforcement with live probes.
+#
+# Model: deny everything, then permit only the flows the data tier needs.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: algot-data
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# DNS is required by every pod that resolves a hostname.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  namespace: algot-data
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# The database accepts connections only from the ingestion workloads and the
+# maintenance CronJobs, and only on 8000. Nothing else in the cluster, and
+# nothing outside it, can reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: database-ingress
+  namespace: algot-data
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: market-data-db
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              algot.io/database-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# The database has no reason to originate traffic to the internet. Allowing
+# only DNS (above) plus nothing else means a compromised database process
+# cannot exfiltrate market data outbound.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: database-egress-deny-external
+  namespace: algot-data
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: market-data-db
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+# Ingestion reaches the database internally, and Alpaca plus London Strategic
+# Edge over HTTPS. The external rule excludes every private range, so this
+# cannot be used to reach other cluster or VCN services.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: ingestion-egress
+  namespace: algot-data
+spec:
+  podSelector:
+    matchLabels:
+      algot.io/database-client: "true"
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: market-data-db
+      ports:
+        - protocol: TCP
+          port: 8000
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Pods that authenticate to OCI as an instance principal need the
+# link-local metadata endpoint. The ingestion pod's snapshot sidecar and the
+# maintenance CronJobs carry this label; nothing else in the namespace can
+# reach 169.254.169.254.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-instance-metadata-egress
+  namespace: algot-data
+spec:
+  podSelector:
+    matchLabels:
+      algot.io/oci-metadata: "true"
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+    # Object Storage and the OCI control plane.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

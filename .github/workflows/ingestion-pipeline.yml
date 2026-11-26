@@ -1,20 +1,5 @@
 name: Ingestion pipeline
 on:
-  pull_request:
-    paths:
-      - 'Data_Ingestion/**'
-      - 'Database/market_data_db/**'
-      - 'Database/pyproject.toml'
-      - '.github/workflows/ingestion-*.yml'
-      - '.github/dependabot.yml'
-  push:
-    branches: [main]
-    tags: ['ingestion-v*']
-    paths:
-      - 'Data_Ingestion/**'
-      - 'Database/market_data_db/**'
-      - 'Database/pyproject.toml'
-      - '.github/workflows/ingestion-*.yml'
   workflow_call:
   workflow_dispatch:
 permissions:
@@ -24,30 +9,41 @@ concurrency:
   cancel-in-progress: true
 jobs:
   ci:
-    uses: ./.github/workflows/ingestion-ci.yml
+    uses: ./.github/workflows/reusable-ci.yml
+    with:
+      service: ingestion
   data:
     needs: ci
     uses: ./.github/workflows/ingestion-data-validation.yml
   security:
     needs: ci
-    uses: ./.github/workflows/ingestion-security.yml
+    uses: ./.github/workflows/reusable-security.yml
+    with:
+      service: ingestion
   build:
     needs: [data, security]
     uses: ./.github/workflows/ingestion-build.yml
+  container-security:
+    needs: build
+    uses: ./.github/workflows/reusable-container-security.yml
+    with:
+      service: ingestion
   performance:
     needs: build
-    uses: ./.github/workflows/ingestion-performance.yml
+    uses: ./.github/workflows/reusable-performance.yml
+    with:
+      service: ingestion
   quality-gate:
-    needs: [ci, data, security, build, performance]
+    needs: [ci, data, security, build, container-security, performance]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require all mandatory results
         env:
-          RESULTS: ${{ needs.ci.result }},${{ needs.data.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs.performance.result }}
+          RESULTS: ${{ needs.ci.result }},${{ needs.data.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs.container-security.result }},${{ needs.performance.result }}
         run: |
-          test "$RESULTS" = 'success,success,success,success,success'
+          test "$RESULTS" = 'success,success,success,success,success,success'
   delivery:
     needs: quality-gate
     if: vars.INGESTION_RELEASE_ENABLED == 'true' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ingestion-v')

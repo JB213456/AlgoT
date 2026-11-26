@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "exceptions": [
+    {
+      "scanner": "gitleaks",
+      "fingerprint": "d130ba4b4efaf8130314543eb48f797db8c30f11:Data_Ingestion/.env.example:generic-api-key:36",
+      "reason": "Historical example has an empty MARKET_DATA_DB_API_KEY; the adjacent numeric flush interval created a multiline generic-key false positive. No credential was committed at this location.",
+      "expires": "2027-01-31"
+    }
+  ]
+}

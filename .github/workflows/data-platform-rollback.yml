@@ -1,0 +1,294 @@
+name: Data platform rollback
+# Roll ONE service back, without touching the other.
+#
+# data-platform-deploy.yml rolls back automatically when its own deployment
+# fails. This workflow is for the other case: a deployment that succeeded,
+# passed its health checks, and only later turned out to be wrong. That
+# decision is a human one, so this is dispatch-only, behind the same
+# environment and the same explicit enable variable as a deployment.
+#
+# The database and ingestion are rolled back independently because they fail
+# independently: a bad ingestion image must not cost a restart of the pod
+# that holds the market data volume.
+#
+# Two mechanisms are offered. `previous` uses the Kubernetes rollout history,
+# which is the fast path. `digest` sets an explicit image digest from
+# deployment/manifests/arm64-digests.json or a dispatch input, which is the
+# only option once the history has been trimmed or when rolling back more
+# than one revision.
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: 'Which service to roll back'
+        required: true
+        type: choice
+        options: [database, ingestion]
+      strategy:
+        description: 'previous = undo the last rollout; digest = pin an explicit image digest'
+        required: true
+        default: 'previous'
+        type: choice
+        options: [previous, digest]
+      image_digest:
+        description: 'Full digest reference, required when strategy = digest (registry/ns/algot-<svc>@sha256:...)'
+        required: false
+        type: string
+      confirm:
+        description: 'Type ROLLBACK to confirm'
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  # The same group as the deployment workflow: a rollback must never run
+  # concurrently with a deployment into the same namespace.
+  group: algot-data-deploy
+  cancel-in-progress: false
+jobs:
+  rollback:
+    name: Roll back ${{ inputs.service }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production-data
+    permissions:
+      contents: read
+    steps:
+      - name: Check the confirmation phrase
+        if: inputs.confirm != 'ROLLBACK'
+        run: |
+          echo "::error::confirm must be exactly ROLLBACK"
+          exit 1
+
+      - name: Require the deployment switch
+        if: vars.DATA_PLATFORM_DEPLOY_ENABLED != 'true'
+        run: |
+          echo "::error::set DATA_PLATFORM_DEPLOY_ENABLED=true to allow rollbacks"
+          exit 1
+
+      - name: Require a digest when one was asked for
+        if: inputs.strategy == 'digest'
+        env:
+          REF: ${{ inputs.image_digest }}
+        run: |
+          # A mutable tag would make the rollback itself unreproducible,
+          # which is the problem this is meant to solve.
+          if [[ -z "$REF" ]]; then
+            echo "::error::strategy 'digest' needs image_digest"
+            exit 1
+          fi
+          if [[ "$REF" != *"@sha256:"* ]]; then
+            echo "::error::image_digest must be an immutable digest reference, got '$REF'"
+            exit 1
+          fi
+          EXPECT="algot-${{ inputs.service }}@"
+          if [[ "$REF" != *"$EXPECT"* ]]; then
+            echo "::error::image_digest '$REF' is not an algot-${{ inputs.service }} image"
+            exit 1
+          fi
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - run: pip install oci-cli==3.97.1
+
+      - name: Write OCI credentials
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.oci
+          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/api_key.pem
+          chmod 600 ~/.oci/api_key.pem
+
+      - name: Grant this runner temporary Kubernetes API access
+        env:
+          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/api_key.pem
+          OCI_CLI_REGION: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          OCI_CLI_AUTH: api_key
+        run: bash deployment/scripts/ci-api-access.sh grant
+
+      - name: Configure kubectl
+        env:
+          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/api_key.pem
+          OCI_CLI_REGION: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          OCI_CLI_AUTH: api_key
+        run: |
+          bash deployment/scripts/setup-kubeconfig.sh
+          echo "KUBECONFIG=$HOME/.kube/algot-oke.config" >> "$GITHUB_ENV"
+
+      - name: Resolve the workload and record the current image
+        id: target
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          case "$SERVICE" in
+            database)  WORKLOAD=statefulset/market-data-db; CONTAINER=market-data-db ;;
+            ingestion) WORKLOAD=deployment/data-ingestion;  CONTAINER=live-ingestion ;;
+            *) echo "::error::unknown service $SERVICE"; exit 1 ;;
+          esac
+          echo "workload=$WORKLOAD" >> "$GITHUB_OUTPUT"
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+
+          if ! kubectl -n algot-data get "$WORKLOAD" >/dev/null 2>&1; then
+            echo "::error::$WORKLOAD is not deployed; there is nothing to roll back"
+            exit 1
+          fi
+
+          CURRENT="$(kubectl -n algot-data get "$WORKLOAD" \
+            -o jsonpath="{.spec.template.spec.containers[?(@.name=='$CONTAINER')].image}")"
+          echo "current image: $CURRENT"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          echo "rollout history:"
+          kubectl -n algot-data rollout history "$WORKLOAD"
+
+      - name: Confirm the other service is left alone
+        id: bystander
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          # Recorded so the summary can prove independence rather than
+          # assert it: the bystander's image and generation must be
+          # identical afterwards.
+          if [[ "$SERVICE" == "database" ]]; then
+            OTHER=deployment/data-ingestion; OC=live-ingestion
+          else
+            OTHER=statefulset/market-data-db; OC=market-data-db
+          fi
+          echo "other=$OTHER" >> "$GITHUB_OUTPUT"
+          if kubectl -n algot-data get "$OTHER" >/dev/null 2>&1; then
+            IMG="$(kubectl -n algot-data get "$OTHER" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$OC')].image}")"
+            GEN="$(kubectl -n algot-data get "$OTHER" -o jsonpath='{.metadata.generation}')"
+            echo "before_image=$IMG" >> "$GITHUB_OUTPUT"
+            echo "before_generation=$GEN" >> "$GITHUB_OUTPUT"
+            echo "$OTHER is at $IMG (generation $GEN) and must not change"
+          else
+            echo "before_image=" >> "$GITHUB_OUTPUT"
+            echo "before_generation=" >> "$GITHUB_OUTPUT"
+            echo "$OTHER is not deployed"
+          fi
+
+      - name: Snapshot the protected market data state
+        run: |
+          mkdir -p /tmp/rollback
+          bash deployment/scripts/assert-data-protection.sh snapshot /tmp/rollback/data-protection.state
+
+      - name: Roll back
+        env:
+          WORKLOAD: ${{ steps.target.outputs.workload }}
+          CONTAINER: ${{ steps.target.outputs.container }}
+          STRATEGY: ${{ inputs.strategy }}
+          REF: ${{ inputs.image_digest }}
+        run: |
+          if [[ "$STRATEGY" == "previous" ]]; then
+            kubectl -n algot-data rollout undo "$WORKLOAD"
+          else
+            kubectl -n algot-data set image "$WORKLOAD" "$CONTAINER=$REF"
+          fi
+
+          # Generous timeout for the database: it must unmount and rebind a
+          # block volume, which a short timeout turns into a false failure
+          # in the middle of a rollback.
+          if [[ "$WORKLOAD" == statefulset/* ]]; then
+            kubectl -n algot-data rollout status "$WORKLOAD" --timeout=600s
+          else
+            kubectl -n algot-data rollout status "$WORKLOAD" --timeout=420s
+          fi
+
+          echo "now running:"
+          kubectl -n algot-data get "$WORKLOAD" \
+            -o jsonpath="{.spec.template.spec.containers[?(@.name=='$CONTAINER')].image}"
+          echo
+
+      - name: Confirm the rolled-back image is still a signed digest
+        env:
+          WORKLOAD: ${{ steps.target.outputs.workload }}
+          CONTAINER: ${{ steps.target.outputs.container }}
+        run: |
+          # The rollout history can only contain what was deployed before,
+          # which was digest-pinned and signature-verified at the time. This
+          # re-asserts it rather than assuming it, because `rollout undo`
+          # would faithfully restore a mutable tag if one had ever been set.
+          IMG="$(kubectl -n algot-data get "$WORKLOAD" \
+            -o jsonpath="{.spec.template.spec.containers[?(@.name=='$CONTAINER')].image}")"
+          if [[ "$IMG" != *"@sha256:"* ]]; then
+            echo "::error::the rolled-back image '$IMG' is not a digest reference"
+            exit 1
+          fi
+          echo "rolled back to the immutable digest $IMG"
+
+      - name: Verify health after the rollback
+        run: bash deployment/scripts/verify-deployment.sh
+
+      - name: Confirm the market data volume is untouched
+        if: always()
+        run: bash deployment/scripts/assert-data-protection.sh compare /tmp/rollback/data-protection.state
+
+      - name: Confirm the other service really was untouched
+        if: always()
+        env:
+          OTHER: ${{ steps.bystander.outputs.other }}
+          BEFORE_IMAGE: ${{ steps.bystander.outputs.before_image }}
+          BEFORE_GENERATION: ${{ steps.bystander.outputs.before_generation }}
+        run: |
+          if [[ -z "$BEFORE_GENERATION" ]]; then
+            echo "$OTHER was not deployed before this rollback; nothing to compare"
+            exit 0
+          fi
+          if [[ "$OTHER" == deployment/* ]]; then OC=live-ingestion; else OC=market-data-db; fi
+          IMG="$(kubectl -n algot-data get "$OTHER" -o jsonpath="{.spec.template.spec.containers[?(@.name=='$OC')].image}")"
+          GEN="$(kubectl -n algot-data get "$OTHER" -o jsonpath='{.metadata.generation}')"
+          failed=0
+          if [[ "$IMG" != "$BEFORE_IMAGE" ]]; then
+            echo "::error::$OTHER image changed: $BEFORE_IMAGE -> $IMG"
+            failed=1
+          fi
+          if [[ "$GEN" != "$BEFORE_GENERATION" ]]; then
+            echo "::error::$OTHER spec was modified: generation $BEFORE_GENERATION -> $GEN"
+            failed=1
+          fi
+          if [[ "$failed" -eq 0 ]]; then
+            echo "$OTHER is unchanged: the rollback was independent."
+          fi
+          exit "$failed"
+
+      - name: Summarise
+        if: always()
+        env:
+          SERVICE: ${{ inputs.service }}
+          STRATEGY: ${{ inputs.strategy }}
+          PREVIOUS: ${{ steps.target.outputs.current }}
+        run: |
+          {
+            echo "## Rolled back $SERVICE"
+            echo
+            echo "- strategy: \`$STRATEGY\`"
+            echo "- image before the rollback: \`$PREVIOUS\`"
+            echo "- the other service was left untouched and re-checked afterwards"
+            echo "- the market data volume identity was re-checked afterwards"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revoke temporary Kubernetes API access
+        if: always()
+        env:
+          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/api_key.pem
+          OCI_CLI_REGION: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          OCI_CLI_AUTH: api_key
+        run: bash deployment/scripts/ci-api-access.sh revoke
+
+      - name: Remove credentials
+        if: always()
+        run: rm -f ~/.oci/api_key.pem "$HOME/.kube/algot-oke.config"

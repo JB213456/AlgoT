@@ -56,7 +56,6 @@ bower_components/
 
 # Market data, database files, journals, exports, and backup copies.
 /data/
-/Data/
 /market_data/
 /backtest_data/
 **/backfill_data/
@@ -127,7 +126,7 @@ temp/
 *.core
 core.*
 .claude/settings.local.json
-.claude/scheduled_tasks.lock
+**/.claude/scheduled_tasks.lock
 
 # Docker local state and volume directories.
 /docker-data/
@@ -156,3 +155,24 @@ Thumbs.db
 Desktop.ini
 $RECYCLE.BIN/
 
+
+# --- Infrastructure (Terraform / Kubernetes) ---
+# State is synced to a private OCI bucket, never committed.
+infrastructure/terraform/.terraform/
+infrastructure/terraform/**/.terraform/
+*.tfplan
+*.tfplan.json
+# `terraform show -json` output: carries every resource attribute in state,
+# so it is treated exactly like state. infrastructure-plan.yml writes
+# infrastructure/terraform/plan.json, which must never be committed.
+infrastructure/terraform/*.json
+free-tier-report.txt
+terraform.tfvars
+*.auto.tfvars
+.terraform.tfstate.lock.info
+# Generated kubeconfig carries a token-minting OCI identity.
+kubeconfig
+kubeconfig-*
+*.kubeconfig
+# Rendered manifests containing real secret values.
+kubernetes/**/*.rendered.yaml

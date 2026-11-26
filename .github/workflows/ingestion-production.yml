@@ -1,5 +1,10 @@
 name: Ingestion production
 on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Signed image digest approved for production
+        required: true
   workflow_call:
     inputs:
       image:
@@ -9,17 +14,12 @@ permissions:
   contents: read
 jobs:
   deploy:
-    if: vars.INGESTION_PRODUCTION_ENABLED == 'true' && vars.INGESTION_PRODUCTION_APPROVED_SHA == github.sha
-    runs-on: [self-hosted, "ingestion-production"]
-    environment: ingestion-production
-    timeout-minutes: 30
-    concurrency: ingestion-production
-    steps:
-      - name: Require approved immutable digest
-        env:
-          IMAGE: ${{ inputs.image }}
-        run: '[[ "$IMAGE" =~ @sha256:[a-f0-9]{64}$ ]]'
-      - name: Deploy validated digest
-        env:
-          IMAGE: ${{ inputs.image }}
-        run: /opt/algot-ingestion/deploy.sh production "$IMAGE"
+    uses: ./.github/workflows/reusable-deployment.yml
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    with:
+      service: ingestion
+      target: production
+      image: ${{ inputs.image }}

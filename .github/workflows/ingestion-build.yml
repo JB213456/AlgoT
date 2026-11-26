@@ -16,9 +16,9 @@ jobs:
         env:
           ALPACA_API_KEY: dummy
           ALPACA_SECRET_KEY: dummy
-        run: docker compose -f Data_Ingestion/docker-compose.yml config -q
+        run: docker compose -f Data/Data_Ingestion/docker-compose.yml config -q
       - name: Build production image once
-        run: docker build --pull -t ingestion-candidate:${{ github.sha }} Data_Ingestion
+        run: docker build --pull -t ingestion-candidate:${{ github.sha }} Data/Data_Ingestion
       - name: Verify non-root user, CLI and healthcheck
         run: |
           test "$(docker image inspect ingestion-candidate:${{ github.sha }} --format '{{.Config.User}}')" = '10002:10002'

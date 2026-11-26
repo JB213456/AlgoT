@@ -1,0 +1,179 @@
+# Integration tests executed against the RUNNING database Service.
+#
+# Two Jobs, both one-shot and both rendered by
+# deployment/scripts/run-database-integration-tests.sh, which substitutes the
+# __PLACEHOLDER__ values and creates the `database-integration-tests`
+# ConfigMap from Data/Database/tests/integration/*.py.
+#
+# These are deliberately Jobs rather than `kubectl exec` into the database
+# pod: the tests must cross the ClusterIP Service and the NetworkPolicy the
+# same way a real client does, and must prove that a pod carrying the
+# `algot.io/database-client` label -- and only such a pod -- can get through.
+---
+# Test 1: the HTTP API, over the Service, from a client pod.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: market-data-db-integration
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: market-data-db-integration
+    app.kubernetes.io/part-of: algot
+    algot.io/role: test
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: market-data-db-integration
+        algot.io/role: test
+        # Required by the database-ingress and ingestion-egress policies;
+        # without this label the Service is unreachable, which is the point.
+        algot.io/database-client: "true"
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: ocir-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        runAsGroup: 10002
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: tests
+          image: __TOOLBOX_IMAGE__
+          command: [python3, /tests/live_service_tests.py]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: DB_URL
+              value: http://market-data-db.algot-data.svc.cluster.local:8000
+            - name: RUN_ID
+              value: "__RUN_ID__"
+            - name: BASELINE_TRADES
+              value: "__BASELINE_TRADES__"
+            - name: BASELINE_QUOTES
+              value: "__BASELINE_QUOTES__"
+            - name: BASELINE_BARS
+              value: "__BASELINE_BARS__"
+          envFrom:
+            - secretRef:
+                name: market-data-db-client
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - { name: tests, mountPath: /tests, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: tests
+          configMap: { name: database-integration-tests, defaultMode: 0555 }
+        - name: tmp
+          emptyDir: { sizeLimit: 128Mi }
+---
+# Test 2: backup and restore, with the live volume mounted READ-ONLY.
+#
+# Restores both a synthetic lake and the real production archive into emptyDir
+# scratch space. The read-only mount is what makes this safe: the job cannot
+# write to the production data even if the test code were wrong, and the test
+# asserts that the mount really is read-only.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: market-data-db-restore-test
+  namespace: algot-data
+  labels:
+    app.kubernetes.io/name: market-data-db-restore-test
+    app.kubernetes.io/part-of: algot
+    algot.io/role: test
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: market-data-db-restore-test
+        algot.io/role: test
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: ocir-pull
+      # ReadWriteOnce permits several pods only on the node already holding
+      # the attachment, so this must land on the database's node.
+      affinity:
+        podAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/name: market-data-db
+              topologyKey: kubernetes.io/hostname
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore-test
+          image: __DATABASE_IMAGE__
+          # Bypasses the image ENTRYPOINT, which would start the API server.
+          command: [python3, /tests/restore_isolation_test.py]
+          env:
+            - name: HOME
+              value: /tmp
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: SCRATCH_ROOT
+              value: /scratch
+            - name: LIVE_ROOT
+              value: /live
+            - name: ARCHIVE
+              value: "__ARCHIVE__"
+            - name: TEST_PROVIDER
+              value: "__TEST_PROVIDER__"
+            - name: EXPECTED_PROVIDER_ROWS
+              value: "__EXPECTED_PROVIDER_ROWS__"
+            - name: BASELINE_TRADES
+              value: "__BASELINE_TRADES__"
+            - name: BASELINE_QUOTES
+              value: "__BASELINE_QUOTES__"
+            - name: BASELINE_BARS
+              value: "__BASELINE_BARS__"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          resources:
+            requests: { cpu: 200m, memory: 768Mi }
+            limits: { cpu: "1", memory: 1536Mi }
+          volumeMounts:
+            - { name: live, mountPath: /live, readOnly: true }
+            - { name: scratch, mountPath: /scratch }
+            - { name: tests, mountPath: /tests, readOnly: true }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: live
+          persistentVolumeClaim:
+            claimName: market-data-db-data
+            readOnly: true
+        # Scratch space for the restores. Node ephemeral storage on the
+        # existing boot volume: no new block volume, no free-tier impact.
+        - name: scratch
+          emptyDir: { sizeLimit: 3Gi }
+        - name: tests
+          configMap: { name: database-integration-tests, defaultMode: 0555 }
+        - name: tmp
+          emptyDir: { sizeLimit: 256Mi }

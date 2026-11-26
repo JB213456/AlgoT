@@ -14,10 +14,10 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: Data_Ingestion/ci-requirements.txt
+          cache-dependency-path: Data/Data_Ingestion/ci-requirements.txt
       - name: Install locked test dependencies
-        run: python -m pip install -r Data_Ingestion/ci-requirements.txt
+        run: python -m pip install -r Data/Data_Ingestion/ci-requirements.txt
       - name: Install local packages without dependency resolution
-        run: python -m pip install --no-deps -e Data_Ingestion/Live -e Data_Ingestion/Backfill -e Data_Ingestion
+        run: python -m pip install --no-deps -e Data/Data_Ingestion/Live -e Data/Data_Ingestion/Backfill -e Data/Data_Ingestion
       - name: Reproducible local throughput and latency baseline
-        run: python Data_Ingestion/ci/benchmark.py
+        run: python Data/Data_Ingestion/ci/benchmark.py

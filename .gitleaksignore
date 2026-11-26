@@ -1,0 +1,2 @@
+# Historical false positive only: empty example API key followed by a numeric setting.
+d130ba4b4efaf8130314543eb48f797db8c30f11:Data_Ingestion/.env.example:generic-api-key:36

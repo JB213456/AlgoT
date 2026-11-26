@@ -1,0 +1,100 @@
+name: Infrastructure plan
+# Holds OCI credentials, so it never runs on pull_request. Untrusted code
+# must not reach these secrets.
+#
+# Produces a plan, then runs the Always Free compliance gate against it. A
+# plan that is not provably free-eligible fails here and is never applied.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/terraform/**'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  # Serialised with apply: both touch the same remote state.
+  group: algot-terraform-state
+  cancel-in-progress: false
+jobs:
+  plan:
+    name: Plan and verify free-tier compliance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: infrastructure-plan
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
+        with:
+          terraform_version: 1.14.4
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install the OCI CLI
+        run: |
+          pip install oci-cli==3.97.1 pyyaml
+
+      - name: Write OCI credentials
+        env:
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          umask 077
+          mkdir -p ~/.oci
+          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/api_key.pem
+          chmod 600 ~/.oci/api_key.pem
+
+      - name: Pull remote state
+        env:
+          OCI_CLI_TENANCY: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_CLI_USER: ${{ secrets.OCI_USER_OCID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_CLI_KEY_FILE: /home/runner/.oci/api_key.pem
+          OCI_CLI_REGION: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          OCI_CLI_AUTH: api_key
+        run: bash deployment/scripts/terraform-state.sh pull
+
+      - name: Terraform init and plan
+        env:
+          TF_VAR_tenancy_ocid: ${{ secrets.OCI_TENANCY_OCID }}
+          TF_VAR_compartment_ocid: ${{ secrets.OCI_COMPARTMENT_OCID }}
+          TF_VAR_user_ocid: ${{ secrets.OCI_USER_OCID }}
+          TF_VAR_fingerprint: ${{ secrets.OCI_FINGERPRINT }}
+          TF_VAR_private_key_path: /home/runner/.oci/api_key.pem
+          TF_VAR_oci_config_file_profile: 'null'
+          TF_VAR_region: ${{ vars.OCI_REGION || 'uk-london-1' }}
+          TF_VAR_api_allowed_cidrs: ${{ vars.API_ALLOWED_CIDRS || '[]' }}
+        run: |
+          terraform -chdir=infrastructure/terraform init -input=false
+          terraform -chdir=infrastructure/terraform plan -input=false -lock=false -out=plan.tfplan
+          terraform -chdir=infrastructure/terraform show -json plan.tfplan > infrastructure/terraform/plan.json
+
+      - name: Always Free compliance gate
+        run: |
+          python3 infrastructure/terraform/policies/free-tier/check_plan.py \
+            infrastructure/terraform/plan.json \
+            --allowlist infrastructure/terraform/policies/free-tier/allowlist.yaml \
+            | tee free-tier-report.txt
+
+      - name: Publish the plan for the apply workflow
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: terraform-plan-${{ github.sha }}
+          # plan.json can contain resource attributes; keep retention short.
+          path: |
+            infrastructure/terraform/plan.tfplan
+            free-tier-report.txt
+          if-no-files-found: error
+          retention-days: 5
+
+      - name: Summarise
+        run: |
+          {
+            echo '## Always Free compliance'
+            echo '```'
+            cat free-tier-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

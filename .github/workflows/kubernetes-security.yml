@@ -1,0 +1,172 @@
+name: Kubernetes security scan
+# The security counterpart to kubernetes-validate.yml, which proves the
+# manifests are well formed and within the free tier. This workflow asks a
+# different question: if one of these pods were compromised, what would the
+# attacker get?
+#
+# It holds NO credentials and touches no cluster, so it is safe on pull
+# requests from forks. Requirement: untrusted pull request workflows must
+# never reach production OCI credentials, Kubernetes credentials or the
+# production database. Nothing here needs any of the three.
+on:
+  pull_request:
+    paths:
+      - 'kubernetes/**'
+      - 'deployment/scripts/validate-k8s-security.py'
+      - 'deployment/scripts/render-placeholders.sh'
+      - '.github/workflows/kubernetes-security.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'kubernetes/**'
+      - 'deployment/scripts/validate-k8s-security.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: k8s-security-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  invariants:
+    name: RBAC, token, network and hardening invariants
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml pytest
+
+      # The gate is tested before it is trusted. These assertions are mostly
+      # of the form "this scanner REJECTS a wildcard Role" -- without them a
+      # silently broken scanner would report a clean pass forever.
+      - name: Test the scanner itself
+        run: pytest deployment/scripts/test_validate_k8s_security.py -q
+
+      - name: Scan the manifests
+        run: python3 deployment/scripts/validate-k8s-security.py kubernetes
+
+  checkov:
+    name: Checkov Kubernetes scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Checkov is given rendered manifests: the sources carry deploy-time
+      # placeholders that are not valid field values.
+      - name: Render the manifests
+        run: bash deployment/scripts/render-placeholders.sh /tmp/rendered-k8s
+
+      # Skips live in kubernetes/.checkov.yaml, next to the manifests they
+      # apply to and with the reason for each recorded, so a local run
+      # evaluates exactly what CI evaluates.
+      - name: Checkov
+        uses: bridgecrewio/checkov-action@471d019012b72cd1e7bb2ee602961347c9ccf560 # v12.3053.0
+        with:
+          directory: /tmp/rendered-k8s
+          config_file: kubernetes/.checkov.yaml
+          framework: kubernetes
+          output_format: cli
+          soft_fail: false
+
+  trivy-config:
+    name: Trivy misconfiguration scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Render the manifests
+        run: bash deployment/scripts/render-placeholders.sh /tmp/rendered-k8s
+
+      # A second opinion from a different rule set. Trivy and Checkov
+      # disagree often enough that running both has found real issues; this
+      # is cheap because it needs no vulnerability database download for
+      # config scanning.
+      - name: Trivy
+        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4 # v0.32.0
+        with:
+          scan-type: config
+          scan-ref: /tmp/rendered-k8s
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          format: table
+
+  pod-security-admission:
+    name: Restricted Pod Security Standard dry run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Render the manifests
+        run: bash deployment/scripts/render-placeholders.sh /tmp/rendered-k8s
+
+      # The in-house scanner checks the fields the restricted profile cares
+      # about, but the authority on whether a pod is admissible is the
+      # admission controller itself. A throwaway kind cluster with the
+      # namespace labelled `restricted` answers that question exactly, and
+      # catches a field the hand-written checks do not know about yet.
+      #
+      # This is a local cluster on the runner: no OKE access, no credentials.
+      - name: Create a local cluster
+        uses: helm/kind-action@a1b0e391336a6ee6713a0583f8c6240d70863de3 # v1.12.0
+        with:
+          cluster_name: pss-check
+          node_image: kindest/node:v1.34.0
+
+      - name: Create the namespace with restricted enforcement
+        run: |
+          kubectl apply -f kubernetes/namespaces/algot-data.yaml
+          kubectl get ns algot-data -o jsonpath='{.metadata.labels}'
+          echo
+
+      - name: Server-side dry run of every workload
+        run: |
+          # --dry-run=server sends the manifest through admission -- Pod
+          # Security Admission included -- without creating anything. The
+          # namespace, quota and limit ranges are already applied above.
+          #
+          # Storage and the OCI-specific objects are excluded: the CSI
+          # driver and the volume OCID do not exist on a kind cluster, so a
+          # failure there would say nothing about Pod Security.
+          status=0
+          for f in /tmp/rendered-k8s/*; do
+            case "$(basename "$f")" in
+              namespaces_*|database_storage.yaml) continue ;;
+            esac
+            echo "== $(basename "$f")"
+            if ! kubectl apply --dry-run=server -f "$f"; then
+              echo "::error::$(basename "$f") was rejected by admission"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Confirm a root pod really would be rejected
+        run: |
+          # Proves the enforcement above is live rather than vacuous. If
+          # this pod were admitted, every result in this job would be
+          # meaningless.
+          cat > /tmp/root-pod.yaml <<'YAML'
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: should-be-rejected
+            namespace: algot-data
+          spec:
+            containers:
+              - name: root
+                image: busybox:latest
+                securityContext:
+                  runAsUser: 0
+                  privileged: true
+          YAML
+          if kubectl apply --dry-run=server -f /tmp/root-pod.yaml 2>/tmp/pss-err; then
+            echo "::error::a privileged root pod was admitted; restricted enforcement is not active"
+            exit 1
+          fi
+          echo "Rejected as expected:"
+          cat /tmp/pss-err
