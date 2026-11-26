@@ -81,18 +81,24 @@ jobs:
       - name: Render the manifests
         run: bash deployment/scripts/render-placeholders.sh /tmp/rendered-k8s
 
+      # Installed from the repository's own pinned, checksum-verified
+      # installer rather than through trivy-action. The action downloads and
+      # runs an installer script from its own checked-out source, which
+      # failed outright on the first real run here; this path verifies a
+      # hard-coded SHA-256 for an exact version instead, and is the same
+      # binary the ARM64 image workflow uses.
+      - name: Install checksum-verified trivy
+        run: bash deployment/scripts/install-security-tools.sh
+
       # A second opinion from a different rule set. Trivy and Checkov
-      # disagree often enough that running both has found real issues; this
-      # is cheap because it needs no vulnerability database download for
-      # config scanning.
+      # disagree often enough that running both is worthwhile; config
+      # scanning needs no vulnerability database, so this is cheap.
       - name: Trivy
-        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4 # v0.32.0
-        with:
-          scan-type: config
-          scan-ref: /tmp/rendered-k8s
-          severity: HIGH,CRITICAL
-          exit-code: '1'
-          format: table
+        run: |
+          trivy config /tmp/rendered-k8s \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format table
 
   pod-security-admission:
     name: Restricted Pod Security Standard dry run
@@ -138,7 +144,19 @@ jobs:
               namespaces_*|database_storage.yaml) continue ;;
             esac
             echo "== $(basename "$f")"
-            if ! kubectl apply --dry-run=server -f "$f"; then
+
+            # `kubectl apply` refuses any object using metadata.generateName
+            # ("cannot use generate name with apply") -- the backfill Job
+            # does, so that one goes through `create` instead. This is a
+            # client-side limitation, not an admission decision, and must
+            # not be reported as a Pod Security failure.
+            if grep -q 'generateName:' "$f"; then
+              verb=(create)
+            else
+              verb=(apply)
+            fi
+
+            if ! kubectl "${verb[@]}" --dry-run=server -f "$f"; then
               echo "::error::$(basename "$f") was rejected by admission"
               status=1
             fi

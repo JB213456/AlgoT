@@ -38,5 +38,5 @@ jobs:
     timeout-minutes: 5
     steps:
       - env:
-          RESULTS: ${{ needs.ci.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs.container-security.result }},${{ needs.performance.result }}
+          RESULTS: ${{ needs.ci.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs['container-security'].result }},${{ needs.performance.result }}
         run: test "$RESULTS" = 'success,success,success,success,success'

@@ -96,9 +96,15 @@ jobs:
             | xargs -0 shellcheck --severity=warning --exclude=SC1091
       - name: Confirm no secrets are committed
         run: |
-          if git ls-files | grep -vE '\.env\.example$' | grep -qE '(^|/)\.env$|\.pem$|terraform\.tfvars$|kubeconfig'; then
+          # Anchored to the start of the basename, so a *script* that merely
+          # has one of these words in its name is not a finding. A bare
+          # `kubeconfig` substring matched
+          # deployment/scripts/setup-kubeconfig.sh, which is source code and
+          # holds no credential.
+          PATTERN='(^|/)\.env$|\.pem$|(^|/)terraform\.tfvars$|(^|/)kubeconfig(\.(ya?ml|json|conf|config))?$|\.kubeconfig$|(^|/)\.kube/|(^|/)id_(rsa|ed25519)$'
+          if git ls-files | grep -vE '\.env\.example$' | grep -qE "$PATTERN"; then
             echo "::error::a credential-bearing file is tracked"
-            git ls-files | grep -vE '\.env\.example$' | grep -E '(^|/)\.env$|\.pem$|terraform\.tfvars$|kubeconfig'
+            git ls-files | grep -vE '\.env\.example$' | grep -E "$PATTERN"
             exit 1
           fi
           echo "No credential files tracked."

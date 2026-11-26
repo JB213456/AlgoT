@@ -41,7 +41,7 @@ jobs:
     steps:
       - name: Require all mandatory results
         env:
-          RESULTS: ${{ needs.ci.result }},${{ needs.data.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs.container-security.result }},${{ needs.performance.result }}
+          RESULTS: ${{ needs.ci.result }},${{ needs.data.result }},${{ needs.security.result }},${{ needs.build.result }},${{ needs['container-security'].result }},${{ needs.performance.result }}
         run: |
           test "$RESULTS" = 'success,success,success,success,success,success'
   delivery:
