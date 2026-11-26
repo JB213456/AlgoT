@@ -163,6 +163,15 @@ Configuration still to be done by an operator:
 5. Populate `deployment/manifests/approved.json` before using the
    amd64/GHCR release path; it is intentionally empty and rejects
    deployment today.
+6. Review the scanner exceptions in `deployment/security/exceptions.json`
+   before they expire. CI fails on an expired entry, so these are deadlines
+   rather than suggestions:
+
+   | Expires | Scanner | Finding | What to check |
+   |---|---|---|---|
+   | 2027-01-31 | gitleaks | `.env.example` generic-key false positive | Still a false positive |
+   | 2027-03-31 | trivy-image | `CVE-2026-76642` (`util-linux`) | Whether Debian 13 has published a fixed `util-linux`; if so, drop the entry and rebuild |
+   | 2027-03-31 | trivy-config | `KSV-0053` (`pods/exec`) | Whether the operational scripts still need `pods/exec`, and that every pod still sets `automountServiceAccountToken: false` |
 
 Not yet verified, and not claimed:
 

@@ -26,7 +26,7 @@ jobs:
           test -z "$(git ls-files Strategies)"
           test -z "$(git ls-files | grep -E '(^|/)(\.env|\.venv)(/|$)' || true)"
       - name: Install scanners
-        run: python -m pip install 'semgrep==1.145.0' 'pip-audit==2.9.0' 'pydantic==2.11.10'
+        run: python -m pip install 'semgrep==1.145.0' 'pip-audit==2.9.0' 'pydantic==2.11.10' 'pytest==8.4.2'
       - name: Scan selected service
         env:
           SERVICE: ${{ inputs.service }}
@@ -36,6 +36,12 @@ jobs:
             ingestion) semgrep scan --config p/python --error Data/Data_Ingestion/Live/live_ingestion Data/Data_Ingestion/Backfill/backfill_engine Data/Data_Ingestion/ingestion_runtime && python Data/Data_Ingestion/ci/policy.py && pip-audit -r Data/Data_Ingestion/ci-requirements.txt ;;
             *) exit 1 ;;
           esac
+      # exceptions.json is the only chokepoint for suppressing a finding in
+      # any scanner, so the gate guarding it is tested before it is trusted:
+      # an expired, unjustified or undocumented suppression must be
+      # rejected, not quietly honoured.
+      - name: Test the security-exception gate
+        run: python -m pytest deployment/scripts/test_validate_security_exceptions.py -q
       - name: Validate time-limited security exceptions
         run: python3 deployment/scripts/validate-security-exceptions.py
       - name: Scan tracked history for secrets

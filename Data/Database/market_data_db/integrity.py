@@ -2,10 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import duckdb
 import pandas as pd
 
-from .config import DBConfig
+from .config import DBConfig, connect_duckdb
 from .schema import Dataset, get_spec
 from .storage.parquet_store import build_scan_sql
 
@@ -39,7 +38,7 @@ def find_duplicates(config: DBConfig, dataset: Dataset, *, sample_limit: int = 2
         return DuplicateReport(dataset, 0, 0, pd.DataFrame())
 
     pk = ", ".join(spec.primary_key)
-    con = duckdb.connect()
+    con = connect_duckdb(config)
     try:
         dup_keys_sql = f"""
             SELECT {pk}, COUNT(*) AS n
@@ -69,7 +68,7 @@ def find_gaps(
     if scan is None:
         return GapReport(symbol, None, pd.DataFrame())
 
-    con = duckdb.connect()
+    con = connect_duckdb(config)
     try:
         clauses = [f"{spec.symbol_col} = ?"]
         params: list = [symbol]
@@ -105,7 +104,7 @@ def row_count(config: DBConfig, dataset: Dataset, *, dedup: str | None = "exact"
     scan = build_scan_sql(config, dataset)
     if scan is None:
         return 0
-    con = duckdb.connect()
+    con = connect_duckdb(config)
     try:
         if dedup is None:
             return int(con.execute(f"SELECT COUNT(*) FROM {scan}").fetchone()[0])

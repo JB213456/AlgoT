@@ -9,12 +9,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
-import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ..config import DBConfig
+from ..config import DBConfig, connect_duckdb
 from ..paths import archive_root, partition_dir
 from ..schema import Dataset, DatasetSpec, get_spec
 from .lock import partition_lock
@@ -132,7 +131,7 @@ def query(
     if scan is None:
         return pd.DataFrame()
 
-    con = duckdb.connect()
+    con = connect_duckdb(config)
     try:
         select_cols = ", ".join(columns) if columns else "*"
         clauses: list[str] = []
